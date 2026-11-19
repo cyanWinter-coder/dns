@@ -62,6 +62,16 @@ type Client struct {
 	TsigSecret   map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	TsigProvider TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
 
+	// TCPFallback, when true and the client uses UDP, makes Exchange and
+	// ExchangeContext retry the query once over TCP when the UDP response is
+	// truncated (has the TC bit set). The fallback re-sends the same message
+	// and must complete within the deadline of the original exchange; it is
+	// never itself retried, even if the TCP response is truncated as well.
+	// When the TCP fallback fails, the returned error is a *FallbackError and
+	// the returned message is the truncated UDP response. The returned RTT
+	// covers both the UDP exchange and the TCP fallback.
+	TCPFallback bool
+
 	// SingleInflight previously serialised multiple concurrent queries for the
 	// same Qname, Qtype and Qclass to ensure only one would be in flight at a
 	// time.
@@ -70,6 +80,21 @@ type Client struct {
 	// query caching if needed. See github.com/miekg/dns/issues/1449.
 	SingleInflight bool
 }
+
+// FallbackError is returned by Client.Exchange and Client.ExchangeContext
+// when Client.TCPFallback is enabled, the UDP response was truncated and the
+// TCP fallback exchange failed. It allows callers to distinguish a failure of
+// the TCP fallback phase from a failure of the initial UDP exchange.
+type FallbackError struct {
+	// UDP is the truncated UDP response that triggered the fallback.
+	UDP *Msg
+	// Err is the error returned by the TCP fallback exchange.
+	Err error
+}
+
+func (e *FallbackError) Error() string { return "dns: tcp fallback failed: " + e.Err.Error() }
+
+func (e *FallbackError) Unwrap() error { return e.Err }
 
 // Exchange performs a synchronous UDP query. It sends the message m to the address
 // contained in a and waits for a reply. Exchange does not retry a failed query, nor
@@ -159,7 +184,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 //	in, rtt, err := c.Exchange(message, "127.0.0.1:53")
 //
 // Exchange does not retry a failed query, nor will it fall back to TCP in
-// case of truncation.
+// case of truncation, unless Client.TCPFallback is set.
 // It is up to the caller to create a message that allows for larger responses to be
 // returned. Specifically this means adding an EDNS0 OPT RR that will advertise a larger
 // buffer, see SetEdns0. Messages without an OPT RR will fallback to the historic limit
@@ -167,13 +192,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 // To specify a local address or a timeout, the caller has to set the `Client.Dialer`
 // attribute appropriately
 func (c *Client) Exchange(m *Msg, address string) (r *Msg, rtt time.Duration, err error) {
-	co, err := c.Dial(address)
-
-	if err != nil {
-		return nil, 0, err
-	}
-	defer co.Close()
-	return c.ExchangeWithConn(m, co)
+	return c.ExchangeContext(context.Background(), m, address)
 }
 
 // ExchangeWithConn has the same behavior as Exchange, just with a predetermined connection
@@ -465,5 +484,65 @@ func (c *Client) ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg,
 	}
 	defer conn.Close()
 
-	return c.ExchangeWithConnContext(ctx, m, conn)
+	tcpNet := ""
+	if c.TCPFallback {
+		tcpNet = tcpFallbackNetwork(c.Net)
+	}
+	if tcpNet == "" {
+		return c.ExchangeWithConnContext(ctx, m, conn)
+	}
+
+	t := time.Now()
+	r, _, err = c.ExchangeWithConnContext(ctx, m, conn)
+	if err != nil || r == nil || !r.Truncated {
+		return r, time.Since(t), err
+	}
+
+	// The UDP response was truncated: retry the same query once over TCP,
+	// bounded by the deadline of the original (UDP) exchange.
+	deadline := t.Add(c.getTimeoutForRequest(c.readTimeout()))
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+
+	fallback := *c
+	fallback.Net = tcpNet
+	fallback.TCPFallback = false // the TCP fallback is never itself retried
+
+	tr, _, err := fallback.ExchangeContext(ctx, m, a)
+	rtt = time.Since(t)
+	if err != nil {
+		return r, rtt, &FallbackError{UDP: r, Err: err}
+	}
+	if !matchingQuestion(m, tr) {
+		return tr, rtt, &FallbackError{UDP: r, Err: ErrQuestion}
+	}
+	return tr, rtt, nil
+}
+
+// tcpFallbackNetwork returns the TCP network corresponding to the given UDP
+// network, or "" if network is not a UDP network.
+func tcpFallbackNetwork(network string) string {
+	switch network {
+	case "", "udp":
+		return "tcp"
+	case "udp4":
+		return "tcp4"
+	case "udp6":
+		return "tcp6"
+	}
+	return ""
+}
+
+// matchingQuestion reports whether the response r answers the question asked
+// in the query m, i.e. whether the question sections agree on name, type and
+// class.
+func matchingQuestion(m, r *Msg) bool {
+	if len(m.Question) == 0 || len(r.Question) == 0 {
+		return len(m.Question) == len(r.Question)
+	}
+	q, a := m.Question[0], r.Question[0]
+	return q.Qtype == a.Qtype && q.Qclass == a.Qclass && strings.EqualFold(q.Name, a.Name)
 }
