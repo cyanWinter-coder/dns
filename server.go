@@ -7,15 +7,57 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Default maximum number of TCP queries before we close the socket.
 const maxTCPQueries = 128
+
+// DefaultDrainTimeout is the default per-handler drain deadline used during
+// Shutdown and ShutdownContext when Server.DrainTimeout is zero.
+const DefaultDrainTimeout = 30 * time.Second
+
+var (
+	// ErrDrainTimeout is the cause (*DrainTimeoutError.Err) returned by
+	// Shutdown and ShutdownContext when the drain deadline expired before
+	// all in-flight handlers and connections finished.
+	ErrDrainTimeout = errors.New("dns: drain timeout expired")
+	// ErrHandlerTimeout is returned by ResponseWriter.Write and
+	// ResponseWriter.WriteMsg when the handler's own drain deadline
+	// expired while the server was shutting down. It is distinguishable
+	// from the global shutdown error returned by ShutdownContext.
+	ErrHandlerTimeout = errors.New("dns: handler drain deadline expired")
+)
+
+// DrainTimeoutError is returned by Shutdown and ShutdownContext when the
+// drain did not complete within the allowed deadline. It reports how many
+// connections and handlers had not finished when the deadline expired.
+// The cause (ErrDrainTimeout or a context error) is available via Err and
+// through errors.Is/errors.As.
+type DrainTimeoutError struct {
+	// Connections is the number of connections still open when the
+	// deadline expired.
+	Connections int
+	// Handlers is the number of handlers still running when the deadline
+	// expired.
+	Handlers int
+	// Err is the underlying cause: ErrDrainTimeout when the server's
+	// drain deadline expired, or the context's error when the context
+	// passed to ShutdownContext was done first.
+	Err error
+}
+
+func (e *DrainTimeoutError) Error() string {
+	return fmt.Sprintf("dns: shutdown drain incomplete: %d connections, %d handlers remaining: %v", e.Connections, e.Handlers, e.Err)
+}
+
+func (e *DrainTimeoutError) Unwrap() error { return e.Err }
 
 // aLongTimeAgo is a non-zero time, far in the past, used for
 // immediate cancellation of network operations.
@@ -66,8 +108,8 @@ type ConnectionStater interface {
 }
 
 type response struct {
-	closed         bool // connection has been closed
-	hijacked       bool // connection has been hijacked by handler
+	closed         atomic.Int32 // connection has been closed
+	hijacked       bool         // connection has been hijacked by handler
 	tsigTimersOnly bool
 	tsigStatus     error
 	tsigRequestMAC string
@@ -77,7 +119,16 @@ type response struct {
 	udpSession     *SessionUDP    // oob data to get egress interface right
 	pcSession      net.Addr       // address to use when writing to a generic net.PacketConn
 	writer         Writer         // writer to output the raw DNS bits
+
+	server    *Server     // server this response belongs to
+	wmu       sync.Mutex  // guards responded, req and serializes writes
+	timedOut  atomic.Bool // the handler's drain deadline expired during shutdown
+	responded bool        // the handler has written at least one message
+	req       *Msg        // request currently being handled, used for the timeout reply
 }
+
+// isClosed reports whether Close has been called on this response.
+func (w *response) isClosed() bool { return w.closed.Load() == 1 }
 
 // handleRefused returns a HandlerFunc that returns REFUSED for every request it gets.
 func handleRefused(w ResponseWriter, r *Msg) {
@@ -246,12 +297,31 @@ type Server struct {
 	MsgAcceptFunc MsgAcceptFunc
 	// MsgInvalidFunc is optional, will be called if a message is received but cannot be parsed.
 	MsgInvalidFunc MsgInvalidFunc
+	// DrainTimeout bounds how long Shutdown and ShutdownContext wait for in-flight
+	// handlers to finish after the server stops accepting new queries. Each
+	// in-flight handler is given its own deadline of DrainTimeout, measured from
+	// the start of the shutdown. When a handler's deadline expires it is sent a
+	// SERVFAIL reply if it has not written anything yet, its connection is closed
+	// and any further writes fail with ErrHandlerTimeout; ShutdownContext returns
+	// a *DrainTimeoutError reporting the number of unfinished connections and
+	// handlers. If zero, DefaultDrainTimeout is used. If negative, shutdown waits
+	// indefinitely for handlers to finish.
+	DrainTimeout time.Duration
 
 	// Shutdown handling
-	lock     sync.RWMutex
-	started  bool
-	shutdown chan struct{}
-	conns    map[net.Conn]struct{}
+	lock            sync.RWMutex
+	started         bool
+	draining        bool // shutdown has been initiated
+	shutdown        chan struct{}
+	conns           map[net.Conn]struct{}
+	responses       map[*response]struct{} // in-flight responses, for drain deadlines
+	inFlight        atomic.Int64           // number of handlers currently running
+	drainTimer      *time.Timer
+	drainExpired    chan struct{} // closed by expireDrain
+	expiredConns    int           // unfinished connections when the drain expired
+	expiredHandlers int           // unfinished handlers when the drain expired
+	listenerOnce    sync.Once     // guards Listener.Close
+	packetConnOnce  sync.Once     // guards PacketConn.Close
 
 	// A pool for UDP message buffers.
 	udpPool sync.Pool
@@ -283,6 +353,14 @@ func makeUDPBuffer(size int) func() interface{} {
 func (srv *Server) init() {
 	srv.shutdown = make(chan struct{})
 	srv.conns = make(map[net.Conn]struct{})
+	srv.responses = make(map[*response]struct{})
+	srv.draining = false
+	srv.drainTimer = nil
+	srv.drainExpired = make(chan struct{})
+	srv.expiredConns = 0
+	srv.expiredHandlers = 0
+	srv.listenerOnce = sync.Once{}
+	srv.packetConnOnce = sync.Once{}
 
 	if srv.UDPSize == 0 {
 		srv.UDPSize = MinMsgSize
@@ -398,7 +476,9 @@ func (srv *Server) ActivateAndServe() error {
 }
 
 // Shutdown shuts down a server. After a call to Shutdown, ListenAndServe and
-// ActivateAndServe will return.
+// ActivateAndServe will return. Shutdown is idempotent: calling it more than
+// once, or racing it with the serve loop exiting, is safe and closes every
+// listener and connection at most once.
 func (srv *Server) Shutdown() error {
 	return srv.ShutdownContext(context.Background())
 }
@@ -406,47 +486,190 @@ func (srv *Server) Shutdown() error {
 // ShutdownContext shuts down a server. After a call to ShutdownContext,
 // ListenAndServe and ActivateAndServe will return.
 //
+// ShutdownContext first stops accepting new queries: reads on the packet
+// connection and Accept on the listener are unblocked, but the listeners
+// themselves are kept open until all in-flight requests have completed.
+// Each in-flight handler then has its own deadline of Server.DrainTimeout
+// to finish; when that deadline expires the handler is sent a SERVFAIL
+// reply (if it has not responded yet), in-progress transfers and blocked
+// writes are aborted by closing the underlying connections exactly once,
+// and ShutdownContext returns a *DrainTimeoutError with the number of
+// connections and handlers that had not finished.
+//
 // A context.Context may be passed to limit how long to wait for connections
-// to terminate.
+// to terminate; when it is done first, the returned *DrainTimeoutError wraps
+// the context's error.
+//
+// ShutdownContext is idempotent: concurrent and repeated calls wait for the
+// same shutdown and report its result.
 func (srv *Server) ShutdownContext(ctx context.Context) error {
 	srv.lock.Lock()
-	if !srv.started {
+	if !srv.started && !srv.draining {
 		srv.lock.Unlock()
 		return &Error{err: "server not started"}
 	}
 
-	srv.started = false
+	if srv.started {
+		srv.started = false
+		srv.draining = true
 
-	if srv.PacketConn != nil {
-		srv.PacketConn.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		// Stop accepting new queries immediately, but keep the listeners
+		// open: they are closed by the serve loops once all in-flight
+		// requests have completed.
+		if srv.PacketConn != nil {
+			srv.PacketConn.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		}
+
+		if srv.Listener != nil {
+			if l, ok := srv.Listener.(interface{ SetDeadline(time.Time) error }); ok {
+				l.SetDeadline(aLongTimeAgo) // Unblock Accept
+			} else {
+				srv.closeListener()
+			}
+		}
+
+		for rw := range srv.conns {
+			rw.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		}
+
+		if timeout := srv.getDrainTimeout(); timeout >= 0 {
+			expired := srv.drainExpired
+			srv.drainTimer = time.AfterFunc(timeout, func() { srv.expireDrain(expired) })
+		}
 	}
 
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
-
-	for rw := range srv.conns {
-		rw.SetReadDeadline(aLongTimeAgo) // Unblock reads
-	}
-
+	shutdown := srv.shutdown
+	drainExpired := srv.drainExpired
 	srv.lock.Unlock()
 
 	if testShutdownNotify != nil {
 		testShutdownNotify.Broadcast()
 	}
 
-	var ctxErr error
+	if srv.getDrainTimeout() < 0 {
+		// No drain deadline: wait indefinitely, like before.
+		select {
+		case <-shutdown:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	select {
+	case <-shutdown:
+		// Drained before the deadline. If the deadline fired concurrently
+		// the drain did not complete cleanly on its own; report it.
+		select {
+		case <-drainExpired:
+			return srv.drainError(ErrDrainTimeout)
+		default:
+		}
+		srv.lock.Lock()
+		if srv.drainTimer != nil {
+			srv.drainTimer.Stop()
+		}
+		srv.lock.Unlock()
+		return nil
+	case <-drainExpired:
+		return srv.drainError(ErrDrainTimeout)
+	case <-ctx.Done():
+		return srv.drainError(ctx.Err())
+	}
+}
+
+// getDrainTimeout returns the per-handler drain deadline for shutdown.
+func (srv *Server) getDrainTimeout() time.Duration {
+	if srv.DrainTimeout == 0 {
+		return DefaultDrainTimeout
+	}
+	return srv.DrainTimeout
+}
+
+// drainError builds the *DrainTimeoutError returned when a shutdown drain
+// did not finish in time, reporting the unfinished connections and handlers.
+func (srv *Server) drainError(cause error) error {
+	srv.lock.RLock()
+	conns := len(srv.conns)
+	handlers := int(srv.inFlight.Load())
+	if cause == ErrDrainTimeout {
+		// Report the counts captured when the deadline expired; the
+		// force-close below may have raced handlers to completion since.
+		conns = srv.expiredConns
+		handlers = srv.expiredHandlers
+	}
+	srv.lock.RUnlock()
+	return &DrainTimeoutError{
+		Connections: conns,
+		Handlers:    handlers,
+		Err:         cause,
+	}
+}
+
+// expireDrain runs when the drain deadline expires. It times out every
+// in-flight handler (sending a SERVFAIL to the ones that have not responded
+// yet) and closes each connection and the packet connection exactly once so
+// that blocked reads, writes and in-progress transfers cannot keep blocking.
+// expired must be the drain-expired channel of the serve cycle the timer was
+// started in; a stale timer from a previous cycle does nothing.
+func (srv *Server) expireDrain(expired chan struct{}) {
+	srv.lock.Lock()
+	if !srv.draining || srv.drainExpired != expired {
+		// The server was restarted since this timer was started.
+		srv.lock.Unlock()
+		return
+	}
 	select {
 	case <-srv.shutdown:
-	case <-ctx.Done():
-		ctxErr = ctx.Err()
+		// The drain already completed cleanly.
+		srv.lock.Unlock()
+		return
+	default:
 	}
-
-	if srv.PacketConn != nil {
-		srv.PacketConn.Close()
+	responses := make([]*response, 0, len(srv.responses))
+	for w := range srv.responses {
+		responses = append(responses, w)
 	}
+	conns := make([]net.Conn, 0, len(srv.conns))
+	for rw := range srv.conns {
+		conns = append(conns, rw)
+	}
+	// Capture the unfinished counts before the force-close below races
+	// the remaining handlers to completion.
+	srv.expiredConns = len(conns)
+	srv.expiredHandlers = int(srv.inFlight.Load())
+	srv.lock.Unlock()
 
-	return ctxErr
+	// Signal the deadline first: closing the connections below unblocks
+	// the remaining handlers, which lets the serve loops close the
+	// shutdown channel — waiters must observe the expiry, not a clean
+	// drain.
+	close(expired)
+	for _, w := range responses {
+		w.timeout()
+	}
+	for _, rw := range conns {
+		rw.Close()
+	}
+	srv.closePacketConn()
+}
+
+// closeListener closes the server listener at most once.
+func (srv *Server) closeListener() {
+	srv.listenerOnce.Do(func() {
+		if srv.Listener != nil {
+			srv.Listener.Close()
+		}
+	})
+}
+
+// closePacketConn closes the server packet connection at most once.
+func (srv *Server) closePacketConn() {
+	srv.packetConnOnce.Do(func() {
+		if srv.PacketConn != nil {
+			srv.PacketConn.Close()
+		}
+	})
 }
 
 var testShutdownNotify *sync.Cond
@@ -461,7 +684,7 @@ func (srv *Server) getReadTimeout() time.Duration {
 
 // serveTCP starts a TCP listener for the server.
 func (srv *Server) serveTCP(l net.Listener) error {
-	defer l.Close()
+	defer srv.closeListener()
 
 	if srv.NotifyStartedFunc != nil {
 		srv.NotifyStartedFunc()
@@ -497,7 +720,7 @@ func (srv *Server) serveTCP(l net.Listener) error {
 
 // serveUDP starts a UDP listener for the server.
 func (srv *Server) serveUDP(l net.PacketConn) error {
-	defer l.Close()
+	defer srv.closePacketConn()
 
 	reader := Reader(defaultReader{srv})
 	if srv.DecorateReader != nil {
@@ -559,12 +782,17 @@ func (srv *Server) serveUDP(l net.PacketConn) error {
 
 // Serve a new TCP connection.
 func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
-	w := &response{tsigProvider: srv.tsigProvider(), tcp: rw}
+	w := &response{server: srv, tsigProvider: srv.tsigProvider(), tcp: rw}
 	if srv.DecorateWriter != nil {
 		w.writer = srv.DecorateWriter(w)
 	} else {
 		w.writer = w
 	}
+
+	srv.lock.Lock()
+	// Track the response to enforce per-handler drain deadlines on shutdown.
+	srv.responses[w] = struct{}{}
+	srv.lock.Unlock()
 
 	reader := Reader(defaultReader{srv})
 	if srv.DecorateReader != nil {
@@ -590,7 +818,7 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 			break
 		}
 		srv.serveDNS(m, w)
-		if w.closed {
+		if w.isClosed() {
 			break // Close() was called
 		}
 		if w.hijacked {
@@ -607,6 +835,7 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 
 	srv.lock.Lock()
 	delete(srv.conns, w.tcp)
+	delete(srv.responses, w)
 	srv.lock.Unlock()
 
 	wg.Done()
@@ -614,14 +843,24 @@ func (srv *Server) serveTCPConn(wg *sync.WaitGroup, rw net.Conn) {
 
 // Serve a new UDP request.
 func (srv *Server) serveUDPPacket(wg *sync.WaitGroup, m []byte, u net.PacketConn, udpSession *SessionUDP, pcSession net.Addr) {
-	w := &response{tsigProvider: srv.tsigProvider(), udp: u, udpSession: udpSession, pcSession: pcSession}
+	w := &response{server: srv, tsigProvider: srv.tsigProvider(), udp: u, udpSession: udpSession, pcSession: pcSession}
 	if srv.DecorateWriter != nil {
 		w.writer = srv.DecorateWriter(w)
 	} else {
 		w.writer = w
 	}
 
+	srv.lock.Lock()
+	// Track the response to enforce per-handler drain deadlines on shutdown.
+	srv.responses[w] = struct{}{}
+	srv.lock.Unlock()
+
 	srv.serveDNS(m, w)
+
+	srv.lock.Lock()
+	delete(srv.responses, w)
+	srv.lock.Unlock()
+
 	wg.Done()
 }
 
@@ -680,7 +919,15 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 		srv.udpPool.Put(m[:srv.UDPSize])
 	}
 
+	// Remember the request so a drain timeout can reply SERVFAIL, and
+	// count the in-flight handler for DrainTimeoutError reporting.
+	w.wmu.Lock()
+	w.req = req
+	w.wmu.Unlock()
+
+	srv.inFlight.Add(1)
 	srv.Handler.ServeDNS(w, req) // Writes back to the client
+	srv.inFlight.Add(-1)
 }
 
 func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
@@ -745,7 +992,7 @@ func (srv *Server) readPacketConn(conn net.PacketConn, timeout time.Duration) ([
 
 // WriteMsg implements the ResponseWriter.WriteMsg method.
 func (w *response) WriteMsg(m *Msg) (err error) {
-	if w.closed {
+	if w.isClosed() {
 		return &Error{err: "WriteMsg called after Close"}
 	}
 
@@ -770,10 +1017,29 @@ func (w *response) WriteMsg(m *Msg) (err error) {
 
 // Write implements the ResponseWriter.Write method.
 func (w *response) Write(m []byte) (int, error) {
-	if w.closed {
+	if w.isClosed() {
 		return 0, &Error{err: "Write called after Close"}
 	}
 
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
+	if w.timedOut.Load() {
+		// The handler's drain deadline expired during shutdown. This is
+		// distinguishable from the global shutdown error returned by
+		// ShutdownContext.
+		return 0, ErrHandlerTimeout
+	}
+
+	n, err := w.writeRaw(m)
+	if err == nil {
+		w.responded = true
+	}
+	return n, err
+}
+
+// writeRaw writes m to the connection. The caller must hold w.wmu, so a
+// message is never interleaved with another write or a drain-timeout reply.
+func (w *response) writeRaw(m []byte) (int, error) {
 	switch {
 	case w.udp != nil:
 		if u, ok := w.udp.(*net.UDPConn); ok {
@@ -788,7 +1054,17 @@ func (w *response) Write(m []byte) (int, error) {
 		msg := make([]byte, 2+len(m))
 		binary.BigEndian.PutUint16(msg, uint16(len(m)))
 		copy(msg[2:], m)
-		return w.tcp.Write(msg)
+		// Write the whole framed message; returning early on a short
+		// write would leave half a DNS message on the wire.
+		written := 0
+		for written < len(msg) {
+			n, err := w.tcp.Write(msg[written:])
+			written += n
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
 	default:
 		panic("dns: internal error: udp and tcp both nil")
 	}
@@ -831,10 +1107,9 @@ func (w *response) Hijack() { w.hijacked = true }
 
 // Close implements the ResponseWriter.Close method
 func (w *response) Close() error {
-	if w.closed {
+	if !w.closed.CompareAndSwap(0, 1) {
 		return &Error{err: "connection already closed"}
 	}
-	w.closed = true
 
 	switch {
 	case w.udp != nil:
@@ -844,6 +1119,35 @@ func (w *response) Close() error {
 		return w.tcp.Close()
 	default:
 		panic("dns: internal error: udp and tcp both nil")
+	}
+}
+
+// timeout marks the response as timed out because its drain deadline expired
+// during a server shutdown. If the handler has not written anything yet, a
+// best-effort SERVFAIL reply is sent so clients can distinguish a drain
+// timeout from a silently dropped query. Further writes fail with
+// ErrHandlerTimeout.
+func (w *response) timeout() {
+	// Set the flag first and unconditionally: a handler blocked in a
+	// write holds wmu, and we must not wait for it here — the connection
+	// is closed right after this, which aborts the write.
+	w.timedOut.Store(true)
+
+	if !w.wmu.TryLock() {
+		// A write is in progress; it is serialized by wmu, so the
+		// connection close that follows cannot interleave a half message
+		// with another write.
+		return
+	}
+	defer w.wmu.Unlock()
+
+	if w.responded || w.req == nil || w.isClosed() {
+		return
+	}
+	m := new(Msg)
+	m.SetRcode(w.req, RcodeServerFailure)
+	if data, err := m.Pack(); err == nil {
+		w.writeRaw(data) // best effort
 	}
 }
 
