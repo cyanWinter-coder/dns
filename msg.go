@@ -71,6 +71,10 @@ var (
 	ErrTime          error = &Error{err: "bad time"}      // ErrTime indicates a timing error in TSIG authentication.
 )
 
+// errTooManyPointers is returned when expanding a domain name follows
+// more compression pointers than allowed.
+var errTooManyPointers = &Error{err: "too many compression pointers"}
+
 // Id by default returns a 16-bit random number to be used as a message id. The
 // number is drawn from a cryptographically secure random number generator.
 // This being a variable the function can be reassigned to a custom function.
@@ -379,10 +383,24 @@ func isRootLabel(s string, bs []byte, off, end int) bool {
 // When an error is encountered, the unpacked name will be discarded
 // and len(msg) will be returned as the offset.
 func UnpackDomainName(msg []byte, off int) (string, int, error) {
-	s := make([]byte, 0, maxDomainNamePresentationLength)
+	return unpackDomainName(msg, off, maxDomainNameWireOctets, maxCompressionPointers)
+}
+
+// unpackDomainName is UnpackDomainName with caller-supplied limits:
+// maxNameLength bounds the expanded wire-format length of the name and
+// maxPointers bounds the number of compression pointers followed.
+func unpackDomainName(msg []byte, off, maxNameLength, maxPointers int) (string, int, error) {
+	// Each wire octet expands to at most 4 presentation octets (\DDD).
+	// Bound the initial allocation by the budget, so a malicious name
+	// can never force a large allocation before the checks below trip.
+	presentCap := 4*maxNameLength + 1
+	if presentCap > maxDomainNamePresentationLength {
+		presentCap = maxDomainNamePresentationLength
+	}
+	s := make([]byte, 0, presentCap)
 	off1 := 0
 	lenmsg := len(msg)
-	budget := maxDomainNameWireOctets
+	budget := maxNameLength
 	ptr := 0 // number of pointers followed
 Loop:
 	for {
@@ -430,8 +448,8 @@ Loop:
 			if ptr == 0 {
 				off1 = off
 			}
-			if ptr++; ptr > maxCompressionPointers {
-				return "", lenmsg, &Error{err: "too many compression pointers"}
+			if ptr++; ptr > maxPointers {
+				return "", lenmsg, errTooManyPointers
 			}
 			// pointer should guarantee that it advances and points forwards at least
 			// but the condition on previous three lines guarantees that it's
@@ -725,18 +743,11 @@ func (dns *Msg) Pack() (msg []byte, err error) {
 
 // PackBuffer packs a Msg, using the given buffer buf. If buf is too small a new buffer is allocated.
 func (dns *Msg) PackBuffer(buf []byte) (msg []byte, err error) {
-	// If this message can't be compressed, avoid filling the
-	// compression map and creating garbage.
-	if dns.Compress && dns.isCompressible() {
-		compression := make(map[string]uint16) // Compression pointer mappings.
-		return dns.packBufferWithCompressionMap(buf, compressionMap{int: compression}, true)
-	}
-
-	return dns.packBufferWithCompressionMap(buf, compressionMap{}, false)
+	return dns.PackBufferWithBudget(buf, Budget{})
 }
 
 // packBufferWithCompressionMap packs a Msg, using the given buffer buf.
-func (dns *Msg) packBufferWithCompressionMap(buf []byte, compression compressionMap, compress bool) (msg []byte, err error) {
+func (dns *Msg) packBufferWithCompressionMap(buf []byte, compression compressionMap, compress bool, budget Budget) (msg []byte, err error) {
 	if dns.Rcode < 0 || dns.Rcode > 0xFFF {
 		return nil, ErrRcode
 	}
@@ -785,43 +796,77 @@ func (dns *Msg) packBufferWithCompressionMap(buf []byte, compression compression
 	dh.Arcount = uint16(len(dns.Extra))
 
 	// We need the uncompressed length here, because we first pack it and then compress it.
-	msg = buf
 	uncompressedLen := msgLenWithCompressionMap(dns, nil)
-	if packLen := uncompressedLen + 1; len(msg) < packLen {
+	packLen := uncompressedLen + 1
+	capped := false
+	if budget.MaxBytes > 0 {
+		// Determine the actual packed size up front, so an insufficient
+		// budget fails before any buffer is allocated or written.
+		size := uncompressedLen
+		if compress {
+			size = msgLenWithCompressionMap(dns, make(map[string]struct{}))
+		}
+		if size > budget.MaxBytes {
+			return nil, fmt.Errorf("%w: packed message needs %d bytes, budget allows %d", ErrBudget, size, budget.MaxBytes)
+		}
+		if packLen > budget.MaxBytes {
+			// Cap the allocation at the budget: the packed message is
+			// known to fit, and we never allocate or write more than
+			// the caller allows.
+			packLen = budget.MaxBytes
+			capped = true
+		}
+	}
+	msg = buf
+	if len(msg) < packLen {
 		msg = make([]byte, packLen)
+	} else {
+		msg = msg[:packLen]
 	}
 
 	// Pack it in: header and then the pieces.
-	off := 0
-	off, err = dh.pack(msg, off, compression, compress)
+	off, err := dns.packSections(msg, &dh, compression, compress)
 	if err != nil {
+		if capped && err == ErrBuf {
+			return nil, fmt.Errorf("%w: packed message exceeds %d byte budget", ErrBudget, budget.MaxBytes)
+		}
 		return nil, err
+	}
+	return msg[:off], nil
+}
+
+// packSections packs the header and all message sections into msg,
+// returning the offset after the last byte written.
+func (dns *Msg) packSections(msg []byte, dh *Header, compression compressionMap, compress bool) (off int, err error) {
+	off, err = dh.pack(msg, 0, compression, compress)
+	if err != nil {
+		return 0, err
 	}
 	for _, r := range dns.Question {
 		off, err = r.pack(msg, off, compression, compress)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
 	for _, r := range dns.Answer {
 		_, off, err = packRR(r, msg, off, compression, compress)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
 	for _, r := range dns.Ns {
 		_, off, err = packRR(r, msg, off, compression, compress)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
 	for _, r := range dns.Extra {
 		_, off, err = packRR(r, msg, off, compression, compress)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 	}
-	return msg[:off], nil
+	return off, nil
 }
 
 func (dns *Msg) unpack(dh Header, msg []byte, off int) (err error) {
