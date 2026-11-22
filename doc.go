@@ -275,6 +275,39 @@ Basic use pattern for a server to check if (and which) options are set:
 		}
 	}
 
+# EDNS0 NEGOTIATION
+
+Sending an OPT RR only advertises capabilities; a response may confirm them,
+ignore them, or reject them. Treating all three cases alike makes retry logic
+guess. The negotiation helpers make the outcome explicit:
+
+	q := dns.NewEDNSQuery(request)        // snapshot the advertised parameters
+	r, n, err := q.ReadResponse(wire)    // decode without exposing half-parsed records
+	switch n.Outcome {
+	case dns.EDNSNegotiated:             // the response confirmed EDNS
+	case dns.EDNSIgnored:                // the peer answered without an OPT RR
+	case dns.EDNSBadVers:                // the peer rejected the version
+	case dns.EDNSFormatError:            // the peer returned FORMERR
+	case dns.EDNSMalformed:              // the response could not be decoded
+	case dns.EDNSStale:                  // a late response to another exchange
+	}
+
+Only capabilities that the query advertised and the peer returned are
+negotiated: EDNSQuery records the advertised UDP size, version, DO/CO bits and
+option codes, and EDNSNegotiation reports the intersection. The retry
+recommendation is available as n.Retry (EDNSRetryWithoutEDNS for BADVERS and
+FORMERR, EDNSRetryOverTCP for a truncated response).
+
+Msg.UnpackResponse never leaves a partially decoded record behind: a
+truncated response keeps the header, the question section and the OPT record,
+and a malformed one keeps only the header and the question section.
+EDNSNegotiation.RewriteResponse builds a reply from an existing message
+without modifying it, drops the OPT RR when EDNS was not negotiated, and
+truncates at record boundaries only.
+
+Msg.Unpack and Msg.Truncate keep their original behaviour; the negotiation
+helpers build on them.
+
 SIG(0)
 
 From RFC 2931:
