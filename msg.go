@@ -61,6 +61,7 @@ var (
 	ErrLongDomain    error = &Error{err: fmt.Sprintf("domain name exceeded %d wire-format octets", maxDomainNameWireOctets)}
 	ErrNoSig         error = &Error{err: "no signature found"}
 	ErrPrivKey       error = &Error{err: "bad private key"}
+	ErrQuestion      error = &Error{err: "question mismatch"} // ErrQuestion indicates that a response does not answer the question of the query.
 	ErrRcode         error = &Error{err: "bad rcode"}
 	ErrRdata         error = &Error{err: "bad rdata"}
 	ErrRRset         error = &Error{err: "bad rrset"}
