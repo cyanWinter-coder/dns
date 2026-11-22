@@ -44,6 +44,12 @@ const (
 	zValue
 	zKey
 
+	// zErr is the value of a token that carries a lexer error (err is
+	// set). It never matches a grammar or rdata expectation, so parsers
+	// that forget to check err still reject the token instead of
+	// interpreting it as valid input.
+	zErr
+
 	zExpectOwnerDir      // Ownername
 	zExpectOwnerBl       // Whitespace after the ownername
 	zExpectAny           // Expect rrtype, ttl or class
@@ -141,6 +147,10 @@ func ReadRR(r io.Reader, file string) (RR, error) {
 // supported. Although $INCLUDE is disabled by default.
 // Note that $GENERATE's range support up to a maximum of 65535 steps.
 //
+// Include loops — a file that includes itself, directly or through a
+// chain of other files — are detected and reported as an error, as is
+// input that ends in the middle of a record.
+//
 // Basic usage pattern when reading from a string (z) containing the
 // zone data:
 //
@@ -185,6 +195,11 @@ type ZoneParser struct {
 	fsys fs.FS
 
 	includeDepth uint8
+
+	// includeChain holds the resolved paths of the $INCLUDE files that
+	// are currently open in this parser chain. It is used to detect
+	// include loops before they hit the maxIncludeDepth limit.
+	includeChain []string
 
 	includeAllowed     bool
 	generateDisallowed bool
@@ -312,6 +327,13 @@ func (zp *ZoneParser) subNext() (RR, bool) {
 // parsing stops, either by reaching the end of the input or an
 // error. After Next returns (nil, false), the Err method will return
 // any error that occurred during parsing.
+//
+// Reaching the end of the input and encountering an error are both
+// terminal states: once Next has returned (nil, false), subsequent
+// calls keep returning (nil, false) without consuming further input,
+// and Err keeps reporting the same result. An RR is only returned
+// after it has been parsed in full; a record that fails to parse is
+// never delivered.
 func (zp *ZoneParser) Next() (RR, bool) {
 	if zp.parseErr != nil {
 		return nil, false
@@ -333,6 +355,13 @@ func (zp *ZoneParser) Next() (RR, bool) {
 	// handling the rdata for each of these types.
 
 	st := zExpectOwnerDir // initial state
+
+	// Start each record from a clean header. Only the owner name is
+	// carried over from the previous record, as a line without an owner
+	// name inherits it. Every other field is (re)set by the current
+	// record below, so a partially parsed record can never leak state
+	// into the next one.
+	zp.h = RR_Header{Name: zp.h.Name}
 	h := &zp.h
 
 	for l, ok := zp.c.Next(); ok; l, ok = zp.c.Next() {
@@ -435,8 +464,6 @@ func (zp *ZoneParser) Next() (RR, bool) {
 
 			// Start with the new file
 			includePath := l.token
-			var r1 io.Reader
-			var e1 error
 			if zp.fsys != nil {
 				// fs.FS always uses / as separator, even on Windows, so use
 				// path instead of filepath here:
@@ -448,12 +475,24 @@ func (zp *ZoneParser) Next() (RR, bool) {
 				// relative, so clean the path and remove leading / if
 				// present:
 				includePath = strings.TrimLeft(path.Clean(includePath), "/")
+			} else if !filepath.IsAbs(includePath) {
+				includePath = filepath.Join(filepath.Dir(zp.file), includePath)
+			}
 
+			// Reject include loops before opening the file again. The
+			// depth limit above remains as a backstop for paths that
+			// resolve differently on each pass through the loop.
+			for _, p := range zp.includeChain {
+				if p == includePath {
+					return zp.setParseError("$INCLUDE loop detected", l)
+				}
+			}
+
+			var r1 io.Reader
+			var e1 error
+			if zp.fsys != nil {
 				r1, e1 = zp.fsys.Open(includePath)
 			} else {
-				if !filepath.IsAbs(includePath) {
-					includePath = filepath.Join(filepath.Dir(zp.file), includePath)
-				}
 				r1, e1 = os.Open(includePath)
 			}
 			if e1 != nil {
@@ -471,6 +510,7 @@ func (zp *ZoneParser) Next() (RR, bool) {
 
 			zp.sub = NewZoneParser(r1, neworigin, includePath)
 			zp.sub.defttl, zp.sub.includeDepth, zp.sub.r = zp.defttl, zp.includeDepth+1, r1
+			zp.sub.includeChain = append(zp.includeChain[:len(zp.includeChain):len(zp.includeChain)], includePath)
 			zp.sub.SetIncludeAllowed(true)
 			zp.sub.SetIncludeFS(zp.fsys)
 			return zp.subNext()
@@ -897,6 +937,7 @@ func (zl *zlexer) Next() (lex, bool) {
 						t, ok := typeToInt(l.token)
 						if !ok {
 							l.token = "unknown RR type"
+							l.value = zErr
 							l.err = true
 							return *l, true
 						}
@@ -914,6 +955,7 @@ func (zl *zlexer) Next() (lex, bool) {
 						t, ok := classToInt(l.token)
 						if !ok {
 							l.token = "unknown class"
+							l.value = zErr
 							l.err = true
 							return *l, true
 						}
@@ -964,6 +1006,7 @@ func (zl *zlexer) Next() (lex, bool) {
 				comi++
 				if comi >= len(com) {
 					l.token = "comment length insufficient for parsing"
+					l.value = zErr
 					l.err = true
 					return *l, true
 				}
@@ -1134,6 +1177,7 @@ func (zl *zlexer) Next() (lex, bool) {
 
 				if zl.brace < 0 {
 					l.token = "extra closing brace"
+					l.value = zErr
 					l.err = true
 					return *l, true
 				}
@@ -1159,6 +1203,16 @@ func (zl *zlexer) Next() (lex, bool) {
 	if zl.readErr != nil && zl.readErr != io.EOF {
 		// Don't return any tokens after a read error occurs.
 		return lex{value: zEOF}, false
+	}
+
+	if zl.quote {
+		// The input ended inside a quoted string: the record is
+		// truncated. Report this instead of returning the partial
+		// string as if it were complete.
+		l.token = "unterminated quoted string"
+		l.value = zErr
+		l.err = true
+		return *l, true
 	}
 
 	var retL lex
@@ -1189,6 +1243,7 @@ func (zl *zlexer) Next() (lex, bool) {
 
 	if zl.brace != 0 {
 		l.token = "unbalanced brace"
+		l.value = zErr
 		l.err = true
 		return *l, true
 	}

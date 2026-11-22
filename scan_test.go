@@ -483,3 +483,175 @@ func TestEscapedStringOffset(t *testing.T) {
 		}
 	}
 }
+
+func TestZoneParserIncludeLoop(t *testing.T) {
+	tmpdir := t.TempDir()
+
+	// A file that includes itself, and a pair of files that include
+	// each other.
+	self := tmpdir + "/self.zone"
+	if err := os.WriteFile(self, []byte("$INCLUDE "+self+"\n"), 0o644); err != nil {
+		t.Fatalf("could not write file for test: %v", err)
+	}
+	a := tmpdir + "/a.zone"
+	b := tmpdir + "/b.zone"
+	if err := os.WriteFile(a, []byte("$INCLUDE "+b+"\n"), 0o644); err != nil {
+		t.Fatalf("could not write file for test: %v", err)
+	}
+	if err := os.WriteFile(b, []byte("$INCLUDE "+a+"\n"), 0o644); err != nil {
+		t.Fatalf("could not write file for test: %v", err)
+	}
+
+	for _, zone := range []string{
+		"$INCLUDE " + self + "\n",
+		"$INCLUDE " + a + "\n",
+	} {
+		zp := NewZoneParser(strings.NewReader(zone), "example.org.", "")
+		zp.SetIncludeAllowed(true)
+		for _, ok := zp.Next(); ok; _, ok = zp.Next() {
+		}
+
+		err := zp.Err()
+		if err == nil || !strings.Contains(err.Error(), "$INCLUDE loop detected") {
+			t.Errorf("%q: expected $INCLUDE loop error, got %v", zone, err)
+			continue
+		}
+		if !strings.Contains(err.Error(), "at line: ") {
+			t.Errorf("%q: expected error to carry a position, got %v", zone, err)
+		}
+	}
+}
+
+func TestZoneParserIncludeLoopFS(t *testing.T) {
+	fsys := fstest.MapFS{
+		"db.loop": &fstest.MapFile{Data: []byte("$INCLUDE db.loop\n")},
+	}
+
+	zp := NewZoneParser(strings.NewReader("$INCLUDE db.loop\n"), "example.org.", "")
+	zp.SetIncludeAllowed(true)
+	zp.SetIncludeFS(fsys)
+	for _, ok := zp.Next(); ok; _, ok = zp.Next() {
+	}
+
+	const expect = "$INCLUDE loop detected"
+	if err := zp.Err(); err == nil || !strings.Contains(err.Error(), expect) {
+		t.Errorf("expected error to contain %q, got %v", expect, zp.Err())
+	}
+}
+
+func TestZoneParserUnterminatedQuote(t *testing.T) {
+	// The input ends inside a quoted string: a truncated record.
+	zp := NewZoneParser(strings.NewReader("foo. IN TXT \"unterminated"), "example.org.", "")
+	for _, ok := zp.Next(); ok; _, ok = zp.Next() {
+		t.Error("expected no RRs from truncated input")
+	}
+
+	err := zp.Err()
+	if err == nil || !strings.Contains(err.Error(), "unterminated quoted string") {
+		t.Fatalf("expected unterminated quoted string error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "at line: 1:") {
+		t.Errorf("expected error to carry a position, got %v", err)
+	}
+}
+
+func TestZoneParserTruncatedRecord(t *testing.T) {
+	// A record whose rdata is cut off at EOF must be an error, not a
+	// silently accepted or silently dropped record.
+	zone := "foo. IN A 10.0.0.1\nbar. IN A 10.0."
+	zp := NewZoneParser(strings.NewReader(zone), "example.org.", "")
+
+	var rrs []RR
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		rrs = append(rrs, rr)
+	}
+	if len(rrs) != 1 {
+		t.Errorf("expected only the complete record, got %d RRs", len(rrs))
+	}
+	if err := zp.Err(); err == nil || !strings.Contains(err.Error(), "at line: 2:") {
+		t.Errorf("expected error at line 2, got %v", err)
+	}
+}
+
+func TestZoneParserTerminalState(t *testing.T) {
+	// Directives, duplicate records and a trailing corrupt entry: the
+	// complete records are delivered, the corrupt one is not, and the
+	// parser then stays in its terminal state.
+	zone := `$ORIGIN example.org.
+$TTL 300
+foo. IN A 10.0.0.1
+foo. IN A 10.0.0.1
+bar. IN A 10.0.
+`
+	zp := NewZoneParser(strings.NewReader(zone), "", "")
+
+	var rrs []RR
+	for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+		rrs = append(rrs, rr)
+	}
+	if len(rrs) != 2 {
+		t.Fatalf("expected 2 complete RRs, got %d", len(rrs))
+	}
+	for _, rr := range rrs {
+		if rr.Header().Ttl != 300 || rr.Header().Class != ClassINET {
+			t.Errorf("directives not applied to %v", rr)
+		}
+	}
+
+	err := zp.Err()
+	if err == nil {
+		t.Fatal("expected an error for the corrupt trailing record")
+	}
+
+	// Once the parser stops, it stays stopped: Next keeps returning
+	// (nil, false) and Err keeps returning the same error.
+	for i := 0; i < 3; i++ {
+		if rr, ok := zp.Next(); ok || rr != nil {
+			t.Errorf("expected (nil, false) after terminal error, got (%v, %v)", rr, ok)
+		}
+		if zp.Err() != err {
+			t.Errorf("expected stable error %v, got %v", err, zp.Err())
+		}
+	}
+	if c := zp.Comment(); c != "" {
+		t.Errorf("expected empty comment after error, got %q", c)
+	}
+}
+
+func TestZoneParserDeterministic(t *testing.T) {
+	// Re-parsing the same input with a fresh parser must yield the
+	// same records and the same terminal state, and a failed parse
+	// must not poison a subsequent, unrelated one.
+	zone := "$TTL 600\nfoo. IN A 10.0.0.1\nfoo. IN A 10.0.0.2\nbar. IN TXT \"hello\"\n"
+
+	parse := func() ([]string, error) {
+		zp := NewZoneParser(strings.NewReader(zone), "example.org.", "")
+		var out []string
+		for rr, ok := zp.Next(); ok; rr, ok = zp.Next() {
+			out = append(out, rr.String())
+		}
+		return out, zp.Err()
+	}
+
+	first, err1 := parse()
+	second, err2 := parse()
+	if err1 != nil || err2 != nil {
+		t.Fatalf("expected no errors, got %v and %v", err1, err2)
+	}
+	if len(first) != 3 || len(second) != 3 {
+		t.Fatalf("expected 3 RRs from both parses, got %d and %d", len(first), len(second))
+	}
+	for i := range first {
+		if first[i] != second[i] {
+			t.Errorf("record %d differs between parses: %q vs %q", i, first[i], second[i])
+		}
+	}
+
+	if _, err := NewRR("bar. IN A 10.0."); err == nil {
+		t.Error("expected error for truncated record")
+	}
+	rr, err := NewRR("baz. IN A 10.0.0.3")
+	if err != nil || rr == nil {
+		t.Errorf("expected clean parse after failed one, got %v, %v", rr, err)
+	}
+}

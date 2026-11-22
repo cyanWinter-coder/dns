@@ -102,6 +102,39 @@ $GENERATE 0-1 $$INCLUDE ` + tmpfile.Name() + `
 	for _, ok := zp.Next(); ok; _, ok = zp.Next() {
 	}
 
+	// The file includes itself through $GENERATE, so the include loop
+	// detection fires before the depth limit is reached.
+	const expected = "$INCLUDE loop detected"
+	if err := zp.Err(); err == nil || !strings.Contains(err.Error(), expected) {
+		t.Errorf("expected error to include %q, got %v", expected, err)
+	}
+}
+
+func TestIncludeDepthLimit(t *testing.T) {
+	// Build a chain of distinct files, each including the next, one
+	// level deeper than maxIncludeDepth. No file is included twice, so
+	// the depth limit (not the loop detection) must stop the parser.
+	tmpdir := t.TempDir()
+	for i := 0; i <= maxIncludeDepth; i++ {
+		path := filepath.Join(tmpdir, fmt.Sprintf("%04d.conf", i))
+		var contents string
+		if i == maxIncludeDepth {
+			contents = "foo\tIN\tA\t127.0.0.1\n"
+		} else {
+			contents = "$INCLUDE " + filepath.Join(tmpdir, fmt.Sprintf("%04d.conf", i+1)) + "\n"
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+			t.Fatalf("could not write file for test: %v", err)
+		}
+	}
+
+	zone := "$INCLUDE " + filepath.Join(tmpdir, "0000.conf") + "\n"
+	zp := NewZoneParser(strings.NewReader(zone), ".", "")
+	zp.SetIncludeAllowed(true)
+
+	for _, ok := zp.Next(); ok; _, ok = zp.Next() {
+	}
+
 	const expected = "too deeply nested $INCLUDE"
 	if err := zp.Err(); err == nil || !strings.Contains(err.Error(), expected) {
 		t.Errorf("expected error to include %q, got %v", expected, err)
