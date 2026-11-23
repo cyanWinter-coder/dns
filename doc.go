@@ -122,6 +122,25 @@ bit to a request.
 
 Signature generation, signature verification and key generation are all supported.
 
+RRSIG.Verify checks a single signature and returns only a yes/no error. For a
+complete chain, a Validator records a separate outcome for the DS, DNSKEY,
+RRSIG and NSEC stages, including the first stage that failed:
+
+	zone := dns.NewZone("example.", ds, keys, keysigs)
+	v := dns.NewValidator(dns.WithNegativeCache(cache))
+	res := v.ValidateAt(dns.ChainRequest{
+		Name: "www.example.", Type: dns.TypeA, Zone: zone,
+		Answer: answer, AnswerSignatures: sigs,
+	}, time.Now())
+	if res.Secure() {
+		// res.Stage(dns.StageRRSIG).String() describes what verified.
+	}
+
+Validation is rollover aware (every key with a signature's key tag is tried,
+old and new), keeps transient failures out of the NegativeCache, and is
+repeatable for a fixed evaluation time. The RRSIG.Verify entry point and its
+error values are unchanged.
+
 # DYNAMIC UPDATES
 
 Dynamic updates reuses the DNS message format, but renames three of the
