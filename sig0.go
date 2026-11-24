@@ -74,8 +74,14 @@ func (rr *SIG) Sign(k crypto.Signer, m *Msg) ([]byte, error) {
 // Verify validates the message buf using the key k.
 // It's assumed that buf is a valid message from which rr was unpacked.
 func (rr *SIG) Verify(k *KEY, buf []byte) error {
+	if rr == nil {
+		return ErrNoSig
+	}
 	if k == nil {
 		return ErrKey
+	}
+	if len(buf) < headerSize {
+		return ErrShortRead
 	}
 	if rr.KeyTag == 0 || rr.SignerName == "" || rr.Algorithm == 0 {
 		return ErrKey

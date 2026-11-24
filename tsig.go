@@ -7,6 +7,8 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"hash"
 	"strconv"
 	"strings"
@@ -91,6 +93,118 @@ func (ts tsigSecretProvider) Verify(msg []byte, t *TSIG) error {
 	}
 	return tsigHMACProvider(key).Verify(msg, t)
 }
+
+// TimeError describes a TSIG timestamp outside the permitted fudge
+// window. It wraps ErrTime so existing errors.Is checks continue to work.
+type TimeError struct {
+	// KeyName is the TSIG key owner name.
+	KeyName string
+
+	// ServerUnix and ClientUnix are the verifier's current time and the
+	// TSIG TimeSigned value, in Unix seconds.
+	ServerUnix int64
+	ClientUnix int64
+
+	// ServerTime and ClientTime are UTC representations of ServerUnix and
+	// ClientUnix.
+	ServerTime time.Time
+	ClientTime time.Time
+
+	// Difference is ServerUnix - ClientUnix. Positive means the server clock
+	// is ahead of the client/signature clock. Offset, Delta and
+	// TimeDifference are aliases for Difference.
+	Difference     time.Duration
+	Offset         time.Duration
+	Delta          time.Duration
+	TimeDifference time.Duration
+
+	// DifferenceSeconds, OffsetSeconds and DeltaSeconds contain the signed
+	// server-client difference in whole seconds.
+	DifferenceSeconds int64
+	OffsetSeconds     int64
+	DeltaSeconds      int64
+
+	// AbsoluteDifference is the magnitude of Difference and is what is
+	// compared with Fudge. AbsoluteOffset and AbsoluteDelta are aliases.
+	AbsoluteDifference time.Duration
+	AbsoluteOffset     time.Duration
+	AbsoluteDelta      time.Duration
+	Skew               time.Duration
+
+	// Fudge is the permitted timestamp error.
+	Fudge        time.Duration
+	FudgeSeconds uint16
+}
+
+// TimeOffsetError is an alternative name for TimeError.
+type TimeOffsetError = TimeError
+
+// TimeSkewError is an alternative name for TimeError.
+type TimeSkewError = TimeError
+
+// TsigTimeError is an alternative name for TimeError.
+type TsigTimeError = TimeError
+
+// ClockSkewError is an alternative name for TimeError.
+type ClockSkewError = TimeError
+
+func (e *TimeError) Error() string {
+	return fmt.Sprintf("%s: TSIG time offset exceeds fudge: server-client time difference=%ds (%s, delta=%s, absolute skew=%s) fudge=%s key=%q server_unix=%d client_unix=%d",
+		ErrTime,
+		e.DifferenceSeconds,
+		e.Difference,
+		e.Delta,
+		e.AbsoluteDifference,
+		e.Fudge,
+		e.KeyName,
+		e.ServerUnix,
+		e.ClientUnix,
+	)
+}
+
+// Unwrap exposes ErrTime for errors.Is and errors.As.
+func (e *TimeError) Unwrap() error { return ErrTime }
+
+// Is allows target to match the wrapped ErrTime sentinel.
+func (e *TimeError) Is(target error) bool { return target == ErrTime }
+
+// secondsToDuration converts whole seconds without overflowing time.Duration
+// for the full uint48 TSIG timestamp range.
+func secondsToDuration(seconds int64) time.Duration {
+	const maxSeconds = int64(^uint64(0)>>1) / int64(time.Second)
+	if seconds > maxSeconds {
+		return time.Duration(1<<63 - 1)
+	}
+	if seconds < -maxSeconds {
+		return time.Duration(-1 << 63)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// IsUnknownKey reports whether err is the package's unknown/missing TSIG key
+// error.
+func IsUnknownKey(err error) bool { return errors.Is(err, ErrSecret) }
+
+// IsUnknownKeyError is an alternative name for IsUnknownKey.
+func IsUnknownKeyError(err error) bool { return IsUnknownKey(err) }
+
+// IsTimeOffset reports whether err is a TSIG timestamp/fudge failure.
+func IsTimeOffset(err error) bool { return errors.Is(err, ErrTime) }
+
+// IsTimeOffsetError is an alternative name for IsTimeOffset.
+func IsTimeOffsetError(err error) bool { return IsTimeOffset(err) }
+
+// IsTimeSkew reports whether err is a TSIG timestamp/fudge failure.
+func IsTimeSkew(err error) bool { return errors.Is(err, ErrTime) }
+
+// IsTimeSkewError is an alternative name for IsTimeSkew.
+func IsTimeSkewError(err error) bool { return IsTimeSkew(err) }
+
+// IsMACMismatch reports whether err is a TSIG MAC verification failure.
+func IsMACMismatch(err error) bool { return errors.Is(err, ErrSig) }
+
+// IsMACMismatchError is an alternative name for IsMACMismatch.
+func IsMACMismatchError(err error) bool { return IsMACMismatch(err) }
 
 // TSIG is the RR the holds the transaction signature of a message.
 // See RFC 2845 and RFC 4635.
@@ -229,7 +343,10 @@ func TsigVerifyWithProvider(msg []byte, provider TsigProvider, requestMAC string
 
 // actual implementation of TsigVerify, taking the current time ('now') as a parameter for the convenience of tests.
 func tsigVerify(msg []byte, provider TsigProvider, requestMAC string, timersOnly bool, now uint64) error {
-	// Strip the TSIG from the incoming msg
+	// Strip the TSIG from the incoming msg. stripTsig returns a private copy
+	// of the covered message prefix because TSIG processing rewrites the
+	// ARCOUNT and original message ID. This keeps msg immutable and makes
+	// repeated verifications deterministic.
 	stripped, tsig, err := stripTsig(msg)
 	if err != nil {
 		return err
@@ -248,12 +365,37 @@ func tsigVerify(msg []byte, provider TsigProvider, requestMAC string, timersOnly
 	// of clock skew.
 	// We check this after verifying the signature, following draft-ietf-dnsop-rfc2845bis
 	// instead of RFC2845, in order to prevent a security vulnerability as reported in CVE-2017-3142/3143.
-	ti := now - tsig.TimeSigned
-	if now < tsig.TimeSigned {
-		ti = tsig.TimeSigned - now
+	serverUnix := int64(now)
+	clientUnix := int64(tsig.TimeSigned)
+	offsetSeconds := serverUnix - clientUnix
+	absoluteSeconds := offsetSeconds
+	if absoluteSeconds < 0 {
+		absoluteSeconds = -absoluteSeconds
 	}
-	if uint64(tsig.Fudge) < ti {
-		return ErrTime
+	if uint64(tsig.Fudge) < uint64(absoluteSeconds) {
+		offset := secondsToDuration(offsetSeconds)
+		absoluteOffset := secondsToDuration(absoluteSeconds)
+		fudge := time.Duration(tsig.Fudge) * time.Second
+		return &TimeError{
+			KeyName:            tsig.Hdr.Name,
+			ServerUnix:         serverUnix,
+			ClientUnix:         clientUnix,
+			ServerTime:         time.Unix(serverUnix, 0).UTC(),
+			ClientTime:         time.Unix(clientUnix, 0).UTC(),
+			Difference:         offset,
+			Offset:             offset,
+			Delta:              offset,
+			TimeDifference:     offset,
+			DifferenceSeconds:  offsetSeconds,
+			OffsetSeconds:      offsetSeconds,
+			DeltaSeconds:       offsetSeconds,
+			AbsoluteDifference: absoluteOffset,
+			AbsoluteOffset:     absoluteOffset,
+			AbsoluteDelta:      absoluteOffset,
+			Skew:               absoluteOffset,
+			Fudge:              fudge,
+			FudgeSeconds:       tsig.Fudge,
+		}
 	}
 
 	return nil
@@ -358,7 +500,7 @@ func stripTsig(msg []byte) ([]byte, *TSIG, error) {
 		return nil, nil, err
 	}
 
-	rr := new(TSIG)
+	rr := (*TSIG)(nil)
 	var extra RR
 	for i := 0; i < int(dh.Arcount); i++ {
 		tsigoff = off
@@ -367,17 +509,24 @@ func stripTsig(msg []byte) ([]byte, *TSIG, error) {
 			return nil, nil, err
 		}
 		if extra.Header().Rrtype == TypeTSIG {
-			rr = extra.(*TSIG)
-			// Adjust Arcount.
-			arcount := binary.BigEndian.Uint16(msg[10:])
-			binary.BigEndian.PutUint16(msg[10:], arcount-1)
+			var ok bool
+			rr, ok = extra.(*TSIG)
+			if !ok {
+				return nil, nil, ErrNoSig
+			}
 			break
 		}
 	}
 	if rr == nil {
 		return nil, nil, ErrNoSig
 	}
-	return msg[:tsigoff], rr, nil
+
+	// Copy the covered prefix and decrement ARCOUNT in that private buffer.
+	// The caller's wire message must remain unchanged so verification can be
+	// retried.
+	stripped := append([]byte(nil), msg[:tsigoff]...)
+	binary.BigEndian.PutUint16(stripped[10:], dh.Arcount-1)
+	return stripped, rr, nil
 }
 
 // Translate the TSIG time signed into a date. There is no

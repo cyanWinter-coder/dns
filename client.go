@@ -222,6 +222,10 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 	co.SetReadDeadline(readDeadline)
 
 	co.TsigSecret, co.TsigProvider = c.TsigSecret, c.TsigProvider
+	// An ordinary exchange is a fresh TSIG transaction even when the
+	// underlying connection is reused. Clear the MAC left by the previous
+	// query; WriteMsg records the new request MAC for ReadMsg below.
+	co.tsigRequestMAC = ""
 
 	if err = co.WriteMsg(m); err != nil {
 		return nil, 0, err

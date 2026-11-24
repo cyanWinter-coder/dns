@@ -667,7 +667,12 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 		return
 	}
 
+	// Reset all per-request signature state. response is reused for every
+	// query on a TCP connection; a failed or unsigned request must not leak
+	// its MAC/chaining state into the next request.
 	w.tsigStatus = nil
+	w.tsigRequestMAC = ""
+	w.tsigTimersOnly = false
 	if w.tsigProvider != nil {
 		if t := req.IsTsig(); t != nil {
 			w.tsigStatus = TsigVerifyWithProvider(m, w.tsigProvider, "", false)

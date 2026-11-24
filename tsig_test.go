@@ -126,7 +126,7 @@ const (
 
 func TestTsigErrors(t *testing.T) {
 	// Helper shortcut to build wire-format test message.
-	// TsigVerify can modify the slice, so we need to create a new one for each test case below.
+	// Build a fresh slice for each assertion so cases cannot share state.
 	buildMsgData := func(tm uint64) []byte {
 		msgData, err := hex.DecodeString(fmt.Sprintf(wireMsg, tm))
 		if err != nil {
@@ -136,10 +136,10 @@ func TestTsigErrors(t *testing.T) {
 	}
 
 	// the signature is valid but 'time signed' is too far from the "current time".
-	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned+301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned+301); !errors.Is(err, ErrTime) {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
-	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned-301); err != ErrTime {
+	if err := tsigVerify(buildMsgData(timeSigned), tsigHMACProvider(testSecret), "", false, timeSigned-301); !errors.Is(err, ErrTime) {
 		t.Fatalf("expected an error '%v' but got '%v'", ErrTime, err)
 	}
 
