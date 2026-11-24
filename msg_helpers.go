@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -427,13 +428,43 @@ func unpackDataOpt(msg []byte, off int) ([]EDNS0, int, error) {
 	return edns, off, nil
 }
 
+func packEDNS0OptionSafe(o EDNS0) (b []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			b = nil
+			err = &Error{err: fmt.Sprintf("invalid EDNS0 option: %v", r)}
+		}
+	}()
+	if o == nil {
+		return nil, &Error{err: "invalid nil EDNS0 option"}
+	}
+	return o.pack()
+}
+
+func edns0OptionCodeSafe(o EDNS0) (code uint16, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			code = 0
+			err = &Error{err: fmt.Sprintf("invalid EDNS0 option: %v", r)}
+		}
+	}()
+	if o == nil {
+		return 0, &Error{err: "invalid nil EDNS0 option"}
+	}
+	return o.Option(), nil
+}
+
 func packDataOpt(options []EDNS0, msg []byte, off int) (int, error) {
 	for _, el := range options {
-		b, err := el.pack()
+		b, err := packEDNS0OptionSafe(el)
 		if err != nil || off+4 > len(msg) {
 			return len(msg), &Error{err: "overflow packing opt"}
 		}
-		binary.BigEndian.PutUint16(msg[off:], el.Option())      // Option code
+		code, err := edns0OptionCodeSafe(el)
+		if err != nil {
+			return len(msg), err
+		}
+		binary.BigEndian.PutUint16(msg[off:], code)             // Option code
 		binary.BigEndian.PutUint16(msg[off+2:], uint16(len(b))) // Length
 		off += 4
 		if off+len(b) > len(msg) {

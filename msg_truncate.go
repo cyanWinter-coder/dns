@@ -22,10 +22,9 @@ package dns
 // no way of knowing which RRs are required so we set the TC bit if any RR
 // had to be omitted from the response.
 //
-// The appropriate buffer size can be retrieved from the requests OPT
-// record, if present, and is transport specific otherwise. dns.MinMsgSize
-// should be used for UDP requests without an OPT record, and
-// dns.MaxMsgSize for TCP requests without an OPT record.
+// The appropriate buffer size can be retrieved from the request's OPT
+// record with Msg.UDPSize. Without an OPT record, UDP uses dns.MinMsgSize;
+// dns.MaxMsgSize is appropriate for TCP.
 func (dns *Msg) Truncate(size int) {
 	if dns.IsTsig() != nil {
 		// To simplify this implementation, we don't perform
@@ -39,6 +38,17 @@ func (dns *Msg) Truncate(size int) {
 	// For ease of use, we impose that restriction here.
 	if size < MinMsgSize {
 		size = MinMsgSize
+	}
+
+	// A malformed EDNS option is unusable for size negotiation and must not
+	// panic while being measured or packed. Treat it as though EDNS were
+	// absent by removing the OPT record before calculating lengths.
+	for {
+		edns0 := dns.IsEdns0()
+		if edns0 == nil || validEDNS0(edns0) {
+			break
+		}
+		dns.popEdns0()
 	}
 
 	l := msgLenWithCompressionMap(dns, nil) // uncompressed length

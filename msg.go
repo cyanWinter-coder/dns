@@ -650,14 +650,28 @@ func UnpackRRWithHeader(h RR_Header, msg []byte, off int) (rr RR, off1 int, err 
 
 // unpackRRslice unpacks msg[off:] into an []RR.
 // If we cannot unpack the whole array, then it will return nil
-func unpackRRslice(l int, msg []byte, off int) (dst1 []RR, off1 int, err error) {
+func unpackRRslice(l int, msg []byte, off int, lenientEDNS ...bool) (dst1 []RR, off1 int, err error) {
 	var r RR
 	// Don't pre-allocate, l may be under attacker control
 	var dst []RR
+	skipInvalidEDNS := len(lenientEDNS) > 0 && lenientEDNS[0]
 	for i := 0; i < l; i++ {
 		off1 := off
 		r, off, err = UnpackRR(msg, off)
 		if err != nil {
+			// A malformed EDNS OPT record can be ignored while treating the
+			// rest of the message as a non-EDNS message. Parse its header
+			// again to find its wire boundary and continue with later RRs.
+			if skipInvalidEDNS {
+				if hdr, rdataOff, _, hdrErr := unpackHeader(msg, off1); hdrErr == nil && hdr.Rrtype == TypeOPT {
+					next := rdataOff + int(hdr.Rdlength)
+					if next > off1 && next <= len(msg) {
+						off = next
+						err = nil
+						continue
+					}
+				}
+			}
 			off = len(msg)
 			break
 		}
@@ -861,7 +875,7 @@ func (dns *Msg) unpack(dh Header, msg []byte, off int) (err error) {
 	// The header counts might have been wrong so we need to update it
 	dh.Nscount = uint16(len(dns.Ns))
 	if err == nil {
-		dns.Extra, _, err = unpackRRslice(int(dh.Arcount), msg, off)
+		dns.Extra, _, err = unpackRRslice(int(dh.Arcount), msg, off, true)
 	}
 	// The header counts might have been wrong so we need to update it
 	dh.Arcount = uint16(len(dns.Extra))
@@ -1047,6 +1061,26 @@ func escapedNameLen(s string) int {
 	}
 
 	return nameLen
+}
+
+// octetStringLen returns the number of octets packOctetString/packTxtString
+// writes for s. Each \DDD or \x escape represents one wire octet, mirroring
+// the escape rules used when packing character strings.
+func octetStringLen(s string) int {
+	l := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			if i == len(s) {
+				break
+			}
+			if isDDD(s[i:]) {
+				i += 2
+			}
+		}
+		l++
+	}
+	return l
 }
 
 func compressionLenSearch(c map[string]struct{}, s string, msgOff int) (int, bool) {

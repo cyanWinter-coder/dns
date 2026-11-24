@@ -145,7 +145,7 @@ func (rr *OPT) len(off int, compression map[string]struct{}) int {
 	l := rr.Hdr.len(off, compression)
 	for _, o := range rr.Option {
 		l += 4 // Account for 2-byte option code and 2-byte option length.
-		lo, _ := o.pack()
+		lo, _ := packEDNS0OptionSafe(o)
 		l += len(lo)
 	}
 	return l
@@ -187,6 +187,38 @@ func (rr *OPT) UDPSize() uint16 {
 // SetUDPSize sets the UDP buffer size.
 func (rr *OPT) SetUDPSize(size uint16) {
 	rr.Hdr.Class = size
+}
+
+// UDPSize returns the UDP payload limit advertised by m. Messages without a
+// valid EDNS0 OPT record use the protocol default, MinMsgSize. Advertised
+// values below MinMsgSize are clamped to that minimum.
+func (m *Msg) UDPSize() int {
+	if m == nil {
+		return MinMsgSize
+	}
+
+	opt := m.IsEdns0()
+	if !validEDNS0(opt) {
+		return MinMsgSize
+	}
+
+	size := int(opt.UDPSize())
+	if size < MinMsgSize {
+		return MinMsgSize
+	}
+	return size
+}
+
+func validEDNS0(opt *OPT) bool {
+	if opt == nil {
+		return false
+	}
+	for _, option := range opt.Option {
+		if _, err := packEDNS0OptionSafe(option); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // Do returns the value of the DO (DNSSEC OK) bit.

@@ -182,7 +182,7 @@ func main() {
 				case `dns:"domain-name"`:
 					o("for _, x := range rr.%s { l += domainNameLen(x, off+l, compression, false) }\n")
 				case `dns:"txt"`:
-					o("for _, x := range rr.%s { l += len(x) + 1 }\n")
+					o("for _, x := range rr.%s { l += octetStringLen(x) + 1 }\n")
 				case `dns:"apl"`:
 					o("for _, x := range rr.%s { l += x.len() }\n")
 				case `dns:"pairs"`:
@@ -217,7 +217,7 @@ func main() {
 			case st.Tag(i) == `dns:"aaaa"`:
 				o("if len(rr.%s) != 0 { l += net.IPv6len }\n")
 			case st.Tag(i) == `dns:"txt"`:
-				o("for _, t := range rr.%s { l += len(t) + 1 }\n")
+				o("for _, t := range rr.%s { l += octetStringLen(t) + 1 }\n")
 			case st.Tag(i) == `dns:"uint48"`:
 				o("l += 6 // %s\n")
 			case st.Tag(i) == `dns:"ipsechost"`:

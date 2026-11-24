@@ -134,9 +134,12 @@ func (dns *Msg) SetEdns0(udpsize uint16, do bool) *Msg {
 // in the additional section. It returns the TSIG record found or nil.
 func (dns *Msg) IsTsig() *TSIG {
 	if len(dns.Extra) > 0 {
-		if dns.Extra[len(dns.Extra)-1].Header().Rrtype == TypeTSIG {
-			return dns.Extra[len(dns.Extra)-1].(*TSIG)
+		rr := dns.Extra[len(dns.Extra)-1]
+		if rr == nil || rr.Header() == nil || rr.Header().Rrtype != TypeTSIG {
+			return nil
 		}
+		tsig, _ := rr.(*TSIG)
+		return tsig
 	}
 	return nil
 }
@@ -149,8 +152,12 @@ func (dns *Msg) IsEdns0() *OPT {
 	// anywhere in the additional record section, but it's usually at
 	// the end so start there.
 	for i := len(dns.Extra) - 1; i >= 0; i-- {
-		if dns.Extra[i].Header().Rrtype == TypeOPT {
-			return dns.Extra[i].(*OPT)
+		rr := dns.Extra[i]
+		if rr == nil || rr.Header() == nil || rr.Header().Rrtype != TypeOPT {
+			continue
+		}
+		if opt, ok := rr.(*OPT); ok {
+			return opt
 		}
 	}
 	return nil
@@ -162,11 +169,16 @@ func (dns *Msg) popEdns0() *OPT {
 	// anywhere in the additional record section, but it's usually at
 	// the end so start there.
 	for i := len(dns.Extra) - 1; i >= 0; i-- {
-		if dns.Extra[i].Header().Rrtype == TypeOPT {
-			opt := dns.Extra[i].(*OPT)
-			dns.Extra = append(dns.Extra[:i], dns.Extra[i+1:]...)
-			return opt
+		rr := dns.Extra[i]
+		if rr == nil || rr.Header() == nil || rr.Header().Rrtype != TypeOPT {
+			continue
 		}
+		opt, ok := rr.(*OPT)
+		if !ok {
+			continue
+		}
+		dns.Extra = append(dns.Extra[:i], dns.Extra[i+1:]...)
+		return opt
 	}
 	return nil
 }
