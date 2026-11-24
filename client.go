@@ -6,9 +6,12 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,6 +49,81 @@ func (co *Conn) tsigProvider() TsigProvider {
 	return tsigSecretProvider(co.TsigSecret)
 }
 
+// Close closes the underlying network connection. It returns ErrConnEmpty when
+// co does not hold a connection.
+func (co *Conn) Close() error {
+	if co == nil || co.Conn == nil {
+		return ErrConnEmpty
+	}
+	return co.Conn.Close()
+}
+
+// A contextCloseWatcher closes a connection when ctx is done unless stop is
+// called before the context event. stop waits for a concurrently started close
+// to finish so the connection is never reused while Close is still running.
+type contextCloseWatcher struct {
+	stopFn func() bool
+	done   chan struct{}
+	once   sync.Once
+}
+
+func watchContextClose(ctx context.Context, co *Conn) *contextCloseWatcher {
+	w := &contextCloseWatcher{done: make(chan struct{})}
+	w.stopFn = context.AfterFunc(ctx, func() {
+		defer close(w.done)
+		_ = co.Close()
+	})
+	return w
+}
+
+func (w *contextCloseWatcher) stop() {
+	if w == nil {
+		return
+	}
+	w.once.Do(func() {
+		if !w.stopFn() {
+			<-w.done
+		}
+	})
+}
+
+// contextExchangeError keeps both the caller's context failure and the network
+// error that unblocked the in-flight operation.
+type contextExchangeError struct {
+	contextErr error
+	err        error
+}
+
+func (e *contextExchangeError) Error() string {
+	if e.err != nil {
+		return e.contextErr.Error() + ": " + e.err.Error()
+	}
+	return e.contextErr.Error()
+}
+
+func (e *contextExchangeError) Unwrap() []error {
+	if e.err != nil {
+		return []error{e.contextErr, e.err}
+	}
+	return []error{e.contextErr}
+}
+
+func (e *contextExchangeError) Timeout() bool {
+	var netErr net.Error
+	if errors.As(e.err, &netErr) {
+		return netErr.Timeout()
+	}
+	return e.contextErr == context.DeadlineExceeded
+}
+
+func (e *contextExchangeError) Temporary() bool {
+	var netErr net.Error
+	if errors.As(e.err, &netErr) {
+		return netErr.Temporary()
+	}
+	return false
+}
+
 // A Client defines parameters for a DNS client.
 type Client struct {
 	Net       string      // if "tcp" or "tcp-tls" (DNS over TLS) a TCP query will be initiated, otherwise an UDP one (default is "" for UDP)
@@ -59,8 +137,21 @@ type Client struct {
 	DialTimeout  time.Duration     // net.DialTimeout, defaults to 2 seconds, or net.Dialer.Timeout if expiring earlier - overridden by Timeout when that value is non-zero
 	ReadTimeout  time.Duration     // net.Conn.SetReadDeadline value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
 	WriteTimeout time.Duration     // net.Conn.SetWriteDeadline value for connections, defaults to 2 seconds - overridden by Timeout when that value is non-zero
+	Servers      []string          // optional failover servers used by ExchangeServersContext; addresses without a port use port 53
+	Attempts     int               // total attempts for ExchangeServersContext; zero means one attempt per server
+	Retry        int               // additional retries after the first attempt; Retry+1 is used when positive
+	Retries      int               // additional retries after the first attempt; Retries+1 takes precedence over Attempts when positive
+	MaxRetries   int               // alias for Retries
 	TsigSecret   map[string]string // secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	TsigProvider TsigProvider      // An implementation of the TsigProvider interface. If defined it replaces TsigSecret and is used for all TSIG operations.
+
+	// ReuseConnections keeps stream connections in an internal pool for
+	// ExchangeContext calls. Idle connections are checked before reuse and
+	// closed when they are no longer healthy.
+	ReuseConnections bool
+
+	// ReuseTCP is an alias for ReuseConnections.
+	ReuseTCP bool
 
 	// SingleInflight previously serialised multiple concurrent queries for the
 	// same Qname, Qtype and Qclass to ensure only one would be in flight at a
@@ -69,6 +160,8 @@ type Client struct {
 	// Deprecated: This is a no-op. Callers should implement their own in flight
 	// query caching if needed. See github.com/miekg/dns/issues/1449.
 	SingleInflight bool
+
+	reusePool atomic.Pointer[ConnPool]
 }
 
 // Exchange performs a synchronous UDP query. It sends the message m to the address
@@ -167,13 +260,7 @@ func (c *Client) DialContext(ctx context.Context, address string) (conn *Conn, e
 // To specify a local address or a timeout, the caller has to set the `Client.Dialer`
 // attribute appropriately
 func (c *Client) Exchange(m *Msg, address string) (r *Msg, rtt time.Duration, err error) {
-	co, err := c.Dial(address)
-
-	if err != nil {
-		return nil, 0, err
-	}
-	defer co.Close()
-	return c.ExchangeWithConn(m, co)
+	return c.ExchangeContext(context.Background(), m, address)
 }
 
 // ExchangeWithConn has the same behavior as Exchange, just with a predetermined connection
@@ -196,6 +283,13 @@ func (c *Client) ExchangeWithConn(m *Msg, conn *Conn) (r *Msg, rtt time.Duration
 // ExchangeWithConnContext has the same behaviour as ExchangeWithConn and
 // additionally obeys deadlines from the passed Context.
 func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) (r *Msg, rtt time.Duration, err error) {
+	if co == nil || co.Conn == nil {
+		return nil, 0, ErrConnEmpty
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	opt := m.IsEdns0()
 	// If EDNS0 is used use that for size.
 	if opt != nil && opt.UDPSize() >= MinMsgSize {
@@ -223,7 +317,16 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 
 	co.TsigSecret, co.TsigProvider = c.TsigSecret, c.TsigProvider
 
+	// Cancellation must unblock a write or read immediately, even when ctx
+	// has no deadline. Closing co interrupts the underlying syscall.
+	watcher := watchContextClose(ctx, co)
+	defer watcher.stop()
+
 	if err = co.WriteMsg(m); err != nil {
+		watcher.stop()
+		if ctx.Err() != nil {
+			return nil, 0, &contextExchangeError{contextErr: ctx.Err(), err: err}
+		}
 		return nil, 0, err
 	}
 
@@ -242,7 +345,16 @@ func (c *Client) ExchangeWithConnContext(ctx context.Context, m *Msg, co *Conn) 
 			err = ErrId
 		}
 	}
+	watcher.stop()
 	rtt = time.Since(t)
+	if ctx.Err() != nil {
+		switch {
+		case err == nil:
+			err = ctx.Err()
+		case !errors.Is(err, ctx.Err()):
+			err = &contextExchangeError{contextErr: ctx.Err(), err: err}
+		}
+	}
 	return r, rtt, err
 }
 
@@ -458,7 +570,23 @@ func DialTimeoutWithTLS(network, address string, tlsConfig *tls.Config, timeout 
 // ExchangeContext acts like Exchange, but honors the deadline on the provided
 // context, if present. If there is both a context deadline and a configured
 // timeout on the client, the earliest of the two takes effect.
+//
+// When address is empty and Client.Servers is non-empty, the request is failed
+// over through ExchangeServersContext. When Client.ReuseConnections is true,
+// stream connections are obtained from the Client's connection pool.
 func (c *Client) ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg, rtt time.Duration, err error) {
+	if a == "" && len(c.Servers) > 0 {
+		var pool *ConnPool
+		if c.ReuseConnections || c.ReuseTCP {
+			pool = c.clientConnPool()
+		}
+		return exchangeServers(ctx, c, m, c.Servers, c.configuredAttempts(), 0, pool)
+	}
+
+	if c.ReuseConnections || c.ReuseTCP {
+		return c.clientConnPool().ExchangeContext(ctx, m, a)
+	}
+
 	conn, err := c.DialContext(ctx, a)
 	if err != nil {
 		return nil, 0, err
@@ -466,4 +594,24 @@ func (c *Client) ExchangeContext(ctx context.Context, m *Msg, a string) (r *Msg,
 	defer conn.Close()
 
 	return c.ExchangeWithConnContext(ctx, m, conn)
+}
+
+func (c *Client) clientConnPool() *ConnPool {
+	if p := c.reusePool.Load(); p != nil {
+		return p
+	}
+	p := NewConnPool(c)
+	if !c.reusePool.CompareAndSwap(nil, p) {
+		_ = p.Close()
+		return c.reusePool.Load()
+	}
+	return p
+}
+
+// CloseIdleConnections closes pooled connections retained when
+// Client.ReuseConnections is enabled.
+func (c *Client) CloseIdleConnections() {
+	if p := c.reusePool.Swap(nil); p != nil {
+		_ = p.Close()
+	}
 }
