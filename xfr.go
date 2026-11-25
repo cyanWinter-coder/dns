@@ -22,6 +22,22 @@ type Transfer struct {
 	TsigSecret     map[string]string // Secret(s) for Tsig map[<zonename>]<base64 secret>, zonename must be in canonical form (lowercase, fqdn, see RFC 4034 Section 6.2)
 	tsigTimersOnly bool
 	TLS            *tls.Config // TLS config. If Xfr over TLS will be attempted
+
+	// Optional opening-SOA serial verification. Setting VerifySerial or
+	// RequireSerialMatch forces exact equality with ExpectedSerial (or the
+	// serial in q.Ns[0]). A non-zero ExpectedSerial also enables exact
+	// verification. Without strict mode, ordinary IXFR serial progression is
+	// accepted while an older server serial is rejected.
+	ExpectedSerial     uint32
+	ExpectedSOASerial  uint32
+	VerifySerial       bool
+	RequireSerialMatch bool
+
+	// Optional atomic publication targets used by VerifiedIn/TransferZone.
+	Store      *ZoneStore
+	ZoneStore  *ZoneStore
+	Holder     *AtomicZone
+	AtomicZone *AtomicZone
 }
 
 func (t *Transfer) tsigProvider() TsigProvider {
@@ -47,10 +63,21 @@ func (t *Transfer) tsigProvider() TsigProvider {
 //	transfer = &dns.Transfer{Conn: dnscon}
 //	channel, err := transfer.In(message, master)
 func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
+	if q == nil || len(q.Question) == 0 {
+		return nil, &Error{err: "no transfer question"}
+	}
 	switch q.Question[0].Qtype {
 	case TypeAXFR, TypeIXFR:
 	default:
 		return nil, &Error{"unsupported question type"}
+	}
+	if q.Question[0].Qtype == TypeIXFR {
+		if len(q.Ns) == 0 {
+			return nil, newTransferError("request", ErrSoa, nil)
+		}
+		if _, ok := q.Ns[0].(*SOA); !ok {
+			return nil, newTransferError("request", ErrSoa, nil)
+		}
 	}
 
 	timeout := dnsTimeout
@@ -84,8 +111,41 @@ func (t *Transfer) In(q *Msg, a string) (env chan *Envelope, err error) {
 	return env, nil
 }
 
+func (t *Transfer) expectedXfrSerial(q *Msg) (serial uint32, strict bool) {
+	serial = t.ExpectedSerial
+	if serial == 0 {
+		serial = t.ExpectedSOASerial
+	}
+	explicitStrict := t.VerifySerial || t.RequireSerialMatch || t.ExpectedSerial != 0 || t.ExpectedSOASerial != 0
+	strict = explicitStrict
+	if len(q.Ns) > 0 {
+		if soa, ok := q.Ns[0].(*SOA); ok {
+			if serial == 0 {
+				serial = soa.Serial
+			}
+			// AXFR requests do not normally contain an SOA. If one is
+			// present, treat it as the required serial. For IXFR the request
+			// SOA is the client's old serial and the opening response SOA is
+			// normally newer, so exact equality is only enforced when the
+			// caller explicitly requests strict verification.
+			if q.Question[0].Qtype != TypeIXFR {
+				strict = true
+			}
+		}
+	}
+	return serial, strict
+}
+
 func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 	first := true
+	expectedSerial, strictSerial := t.expectedXfrSerial(q)
+	partial := &PartialTransfer{
+		Zone:           q.Question[0].Name,
+		Request:        q,
+		ID:             q.Id,
+		Qtype:          TypeAXFR,
+		ExpectedSerial: expectedSerial,
+	}
 	defer func() {
 		// First close the connection, then the channel. This allows functions blocked on
 		// the channel to assume that the connection is closed and no further operations are
@@ -101,34 +161,54 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 		t.Conn.SetReadDeadline(time.Now().Add(timeout))
 		in, err := t.ReadMsg()
 		if err != nil {
+			err = classifyReadError("axfr", err, partial, partial.EndMarker)
 			c <- &Envelope{nil, err}
 			return
 		}
 		if q.Id != in.Id {
-			c <- &Envelope{in.Answer, ErrId}
+			err := newTransferError("axfr", ErrId, partial)
+			c <- &Envelope{in.Answer, err}
 			return
 		}
 		if first {
 			if in.Rcode != RcodeSuccess {
-				c <- &Envelope{in.Answer, &Error{err: fmt.Sprintf(errXFR, in.Rcode)}}
+				rcodeErr := &Error{err: fmt.Sprintf(errXFR, in.Rcode)}
+				err := newTransferError("axfr", rcodeErr, partial)
+				c <- &Envelope{in.Answer, err}
 				return
 			}
 			if !isSOAFirst(in) {
-				c <- &Envelope{in.Answer, ErrSoa}
+				err := newTransferError("axfr", ErrSoa, partial)
+				c <- &Envelope{in.Answer, err}
+				return
+			}
+			actualSerial := in.Answer[0].(*SOA).Serial
+			partial.FirstSerial = actualSerial
+			partial.CurrentSerial = actualSerial
+			partial.Started = true
+			if strictSerial && expectedSerial != actualSerial {
+				err := newTransferError("axfr", ErrSerialMismatch, partial)
+				c <- &Envelope{in.Answer, err}
 				return
 			}
 			first = !first
 			// only one answer that is SOA, receive more
 			if len(in.Answer) == 1 {
 				t.tsigTimersOnly = true
+				partial.RRs = append(partial.RRs, in.Answer...)
+				partial.syncAliases()
 				c <- &Envelope{in.Answer, nil}
 				continue
 			}
 		}
 
+		partial.RRs = append(partial.RRs, in.Answer...)
+		partial.syncAliases()
 		if !first {
 			t.tsigTimersOnly = true // Subsequent envelopes use this.
 			if isSOALast(in) {
+				partial.EndMarker = true
+				partial.Complete = true
 				c <- &Envelope{in.Answer, nil}
 				return
 			}
@@ -139,9 +219,20 @@ func (t *Transfer) inAxfr(q *Msg, c chan *Envelope) {
 
 func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 	var serial uint32 // The first serial seen is the current server serial
-	axfr := true
-	n := 0
+	axfr := false
+	rrCount := 0
+	currentSerial := uint32(0)
+	removeMode := false
 	qser := q.Ns[0].(*SOA).Serial
+	expectedSerial, strictSerial := t.expectedXfrSerial(q)
+	partial := &PartialTransfer{
+		Zone:           q.Question[0].Name,
+		Request:        q,
+		ID:             q.Id,
+		Qtype:          TypeIXFR,
+		ExpectedSerial: expectedSerial,
+		RequestSerial:  qser,
+	}
 	defer func() {
 		// First close the connection, then the channel. This allows functions blocked on
 		// the channel to assume that the connection is closed and no further operations are
@@ -153,53 +244,128 @@ func (t *Transfer) inIxfr(q *Msg, c chan *Envelope) {
 	if t.ReadTimeout != 0 {
 		timeout = t.ReadTimeout
 	}
+
+	fail := func(err error, answer []RR) {
+		c <- &Envelope{RR: answer, Error: err}
+	}
+
 	for {
 		t.SetReadDeadline(time.Now().Add(timeout))
 		in, err := t.ReadMsg()
 		if err != nil {
-			c <- &Envelope{nil, err}
+			err = classifyReadError("ixfr", err, partial, partial.EndMarker)
+			fail(err, nil)
 			return
 		}
+		partial.MessageCount++
 		if q.Id != in.Id {
-			c <- &Envelope{in.Answer, ErrId}
+			fail(newTransferError("ixfr", ErrId, partial), in.Answer)
 			return
 		}
 		if in.Rcode != RcodeSuccess {
-			c <- &Envelope{in.Answer, &Error{err: fmt.Sprintf(errXFR, in.Rcode)}}
+			rcodeErr := &Error{err: fmt.Sprintf(errXFR, in.Rcode)}
+			fail(newTransferError("ixfr", rcodeErr, partial), in.Answer)
 			return
 		}
-		if n == 0 {
-			// Check if the returned answer is ok
+		if rrCount == 0 {
+			// Check if the returned answer is ok.
 			if !isSOAFirst(in) {
-				c <- &Envelope{in.Answer, ErrSoa}
+				fail(newTransferError("ixfr", ErrSoa, partial), in.Answer)
 				return
 			}
-			// This serial is important
+			// This serial is important.
 			serial = in.Answer[0].(*SOA).Serial
-			// Check if there are no changes in zone
+			partial.Started = true
+			partial.FirstSerial = serial
+			partial.CurrentSerial = serial
+			// Explicit strict verification requires the opening serial to be
+			// exactly the configured/requested serial.
+			if strictSerial && expectedSerial != serial {
+				fail(newTransferError("ixfr", ErrSerialMismatch, partial), in.Answer)
+				return
+			}
+			// Preserve the historical IXFR behavior: a requested serial at or
+			// beyond the server serial is accepted as an up-to-date/no-change
+			// response. Strict serial verification above is the opt-in way to
+			// reject an older server.
 			if qser >= serial {
-				c <- &Envelope{in.Answer, nil}
+				partial.EndMarker = true
+				partial.Complete = true
+				partial.RRs = append(partial.RRs, in.Answer...)
+				partial.syncAliases()
+				c <- &Envelope{RR: in.Answer}
 				return
 			}
 		}
-		// Now we need to check each message for SOA records, to see what we need to do
+
+		partial.RRs = append(partial.RRs, in.Answer...)
+		partial.syncAliases()
+
+		// Validate the RFC 1995 add/remove sequence. This is the incremental
+		// transfer's message-level sequence check.
 		t.tsigTimersOnly = true
 		for _, rr := range in.Answer {
+			rrCount++
 			if v, ok := rr.(*SOA); ok {
-				if v.Serial == serial {
-					n++
-					// quit if it's a full axfr or the servers' SOA is repeated the third time
-					if axfr && n == 2 || n == 3 {
-						c <- &Envelope{in.Answer, nil}
+				if rrCount == 1 {
+					// Already checked above.
+					continue
+				} else if rrCount == 2 {
+					if v.Serial < serial {
+						// First difference sequence: removals come first.
+						currentSerial = v.Serial
+						removeMode = true
+						continue
+					} else if !axfr {
+						// The second record is not older, so this may be AXFR
+						// with empty middle content.
+						axfr = true
+					}
+				}
+
+				if axfr {
+					if v.Serial != serial {
+						fail(newTransferError("ixfr", ErrSoa, partial), in.Answer)
 						return
 					}
-				} else if axfr {
-					// it's an ixfr
-					axfr = false
+					partial.EndMarker = true
+					partial.Complete = true
+					c <- &Envelope{RR: in.Answer}
+					return
 				}
+
+				// Differential sequence SOAs cannot be newer than the current
+				// server serial or older than the sequence's starting serial.
+				if v.Serial > serial || v.Serial < currentSerial {
+					fail(newTransferError("ixfr", ErrSoa, partial), in.Answer)
+					return
+				}
+
+				// Flip between remove and add sections.
+				removeMode = !removeMode
+
+				// Adjacent difference sequences share the same serial.
+				if removeMode && currentSerial != v.Serial {
+					fail(newTransferError("ixfr", ErrSoa, partial), in.Answer)
+					return
+				}
+
+				currentSerial = v.Serial
+
+				// The final IXFR SOA starts the remove section and carries the
+				// current server serial.
+				if removeMode && v.Serial == serial {
+					partial.EndMarker = true
+					partial.Complete = true
+					c <- &Envelope{RR: in.Answer}
+					return
+				}
+			} else if rrCount == 2 {
+				// If the second RR is not an SOA this is full AXFR style.
+				axfr = true
 			}
 		}
-		c <- &Envelope{in.Answer, nil}
+		c <- &Envelope{RR: in.Answer}
 	}
 }
 
