@@ -11,6 +11,7 @@ package dns
 //go:generate go run msg_generate.go
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -113,6 +114,32 @@ type Msg struct {
 	Answer   []RR       // Holds the RR(s) of the answer section.
 	Ns       []RR       // Holds the RR(s) of the authority section.
 	Extra    []RR       // Holds the RR(s) of the additional section.
+
+	// ctx is the request lifecycle context installed by the server. It is
+	// intentionally not exported as a struct field; use Context and
+	// WithContext. It is not included in wire packing or JSON output.
+	ctx context.Context
+}
+
+// Context returns the lifecycle context associated with this request. For a
+// request delivered by Server, the context is canceled when its per-request
+// timeout expires, when the base context is canceled, or when graceful
+// shutdown starts. A manually constructed message without an attached context
+// returns context.Background.
+func (m *Msg) Context() context.Context {
+	if m == nil || m.ctx == nil {
+		return context.Background()
+	}
+	return m.ctx
+}
+
+// WithContext attaches ctx to m and returns m. If ctx is nil, Context falls
+// back to context.Background. Unlike http.Request.WithContext, this method
+// mutates m so handlers that ignore its return value still observe the context
+// installed by the server.
+func (m *Msg) WithContext(ctx context.Context) *Msg {
+	m.ctx = ctx
+	return m
 }
 
 // ClassToString is a maps Classes to strings for each CLASS wire type.
@@ -1076,6 +1103,7 @@ func (dns *Msg) Copy() *Msg { return dns.CopyTo(new(Msg)) }
 func (dns *Msg) CopyTo(r1 *Msg) *Msg {
 	r1.MsgHdr = dns.MsgHdr
 	r1.Compress = dns.Compress
+	r1.ctx = dns.ctx
 
 	if len(dns.Question) > 0 {
 		// TODO(miek): Question is an immutable value, ok to do a shallow-copy

@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,6 +36,76 @@ type HandlerFunc func(ResponseWriter, *Msg)
 // ServeDNS calls f(w, r).
 func (f HandlerFunc) ServeDNS(w ResponseWriter, r *Msg) {
 	f(w, r)
+}
+
+// HandlerContext is an optional, context-aware extension of Handler.
+// Handlers may implement it directly, or register a HandlerFuncContext.
+// The original Handler interface remains unchanged for compatibility.
+type HandlerContext interface {
+	ServeDNS(context.Context, ResponseWriter, *Msg)
+}
+
+// HandlerWithContext is an alias for HandlerContext.
+type HandlerWithContext = HandlerContext
+
+// HandlerFuncContext is the context-aware counterpart of HandlerFunc.
+type HandlerFuncContext func(context.Context, ResponseWriter, *Msg)
+
+// ServeDNS calls f(ctx, w, r).
+func (f HandlerFuncContext) ServeDNS(ctx context.Context, w ResponseWriter, r *Msg) {
+	f(ctx, w, r)
+}
+
+// HandlerFuncWithContext is an alias for HandlerFuncContext.
+type HandlerFuncWithContext = HandlerFuncContext
+
+// ContextHandler is an alternative optional handler interface. It is honored
+// when a value does not implement HandlerContext.
+type ContextHandler interface {
+	ServeDNSContext(context.Context, ResponseWriter, *Msg)
+}
+
+// ContextHandlerFunc adapts a function to ContextHandler. It also implements
+// HandlerContext for convenience.
+type ContextHandlerFunc func(context.Context, ResponseWriter, *Msg)
+
+// ServeDNS calls f(ctx, w, r).
+func (f ContextHandlerFunc) ServeDNS(ctx context.Context, w ResponseWriter, r *Msg) {
+	f(ctx, w, r)
+}
+
+// ServeDNSContext calls f(ctx, w, r).
+func (f ContextHandlerFunc) ServeDNSContext(ctx context.Context, w ResponseWriter, r *Msg) {
+	f(ctx, w, r)
+}
+
+// contextHandlerAdapter exposes a HandlerContext through the original Handler
+// interface while retaining the context for context-aware dispatch.
+type contextHandlerAdapter struct {
+	hc HandlerContext
+}
+
+func (h contextHandlerAdapter) ServeDNS(w ResponseWriter, r *Msg) {
+	h.hc.ServeDNS(r.Context(), w, r)
+}
+
+func (h contextHandlerAdapter) ServeDNSContext(ctx context.Context, w ResponseWriter, r *Msg) {
+	h.hc.ServeDNS(ctx, w, r)
+}
+
+// dispatchHandler invokes the most context-aware method available while
+// preserving the original Handler contract as the fallback.
+func dispatchHandler(ctx context.Context, h Handler, w ResponseWriter, r *Msg) {
+	switch hh := h.(type) {
+	case ContextHandler:
+		hh.ServeDNSContext(ctx, w, r)
+	case interface {
+		ServeDNSWithContext(context.Context, ResponseWriter, *Msg)
+	}:
+		hh.ServeDNSWithContext(ctx, w, r)
+	default:
+		h.ServeDNS(w, r)
+	}
 }
 
 // A ResponseWriter interface is used by an DNS handler to
@@ -65,6 +136,20 @@ type ConnectionStater interface {
 	ConnectionState() *tls.ConnectionState
 }
 
+// ResponseWriterWithContext is an optional ResponseWriter implemented by
+// servers that attach a lifecycle context to each request. The context is also
+// available through Msg.Context.
+type ResponseWriterWithContext interface {
+	ResponseWriter
+	Context() context.Context
+}
+
+// ContextResponseWriter is an alias for ResponseWriterWithContext.
+type ContextResponseWriter = ResponseWriterWithContext
+
+// ResponseWriterContext is an alias for ResponseWriterWithContext.
+type ResponseWriterContext = ResponseWriterWithContext
+
 type response struct {
 	closed         bool // connection has been closed
 	hijacked       bool // connection has been hijacked by handler
@@ -77,6 +162,17 @@ type response struct {
 	udpSession     *SessionUDP    // oob data to get egress interface right
 	pcSession      net.Addr       // address to use when writing to a generic net.PacketConn
 	writer         Writer         // writer to output the raw DNS bits
+	ctx            context.Context
+}
+
+// Context returns the request lifecycle context. It is the same context made
+// available through Msg.Context and is safe for handlers and decorators to
+// retain until the request returns.
+func (w *response) Context() context.Context {
+	if w == nil || w.ctx == nil {
+		return context.Background()
+	}
+	return w.ctx
 }
 
 // handleRefused returns a HandlerFunc that returns REFUSED for every request it gets.
@@ -124,9 +220,9 @@ func ListenAndServeTLS(addr, certFile, keyFile string, handler Handler) error {
 	return server.ListenAndServe()
 }
 
-// ActivateAndServe activates a server with a listener from systemd,
-// l and p should not both be non-nil.
-// If both l and p are not nil only p will be used.
+// ActivateAndServe activates a server with a listener from systemd.
+// l and p may both be non-nil, in which case TCP and UDP are served and shut
+// down together. Otherwise the non-nil listener is used.
 // Invoke handler for incoming queries.
 func ActivateAndServe(l net.Listener, p net.PacketConn, handler Handler) error {
 	server := &Server{Listener: l, PacketConn: p, Handler: handler}
@@ -202,7 +298,9 @@ func defaultMsgInvalidFunc(m []byte, err error) {}
 type Server struct {
 	// Address to listen on, ":dns" if empty.
 	Addr string
-	// if "tcp" or "tcp-tls" (DNS over TLS) it will invoke a TCP listener, otherwise an UDP one
+	// if "tcp" or "tcp-tls" (DNS over TLS) it will invoke a TCP listener, otherwise an UDP one.
+	// Combined values such as "udp+tcp", "tcp+udp", or "both" bind and serve
+	// the same port over both UDP and TCP in one Server.
 	Net string
 	// TCP Listener to use, this is to aid in systemd's socket activation.
 	Listener net.Listener
@@ -247,15 +345,93 @@ type Server struct {
 	// MsgInvalidFunc is optional, will be called if a message is received but cannot be parsed.
 	MsgInvalidFunc MsgInvalidFunc
 
+	// HandlerContext is an optional context-aware handler. When non-nil it is
+	// invoked instead of Handler. Handlers assigned to Handler may also
+	// implement HandlerContext or ContextHandler.
+	HandlerContext HandlerContext
+	// HandlerWithContext is an alias field for HandlerContext.
+	HandlerWithContext HandlerWithContext
+	// ContextHandler is an alternative field for a handler implementing
+	// ContextHandler. The first non-nil context field wins.
+	ContextHandler ContextHandler
+
+	// BaseContext is the parent context for all request contexts. When nil,
+	// Context, Ctx, BaseContextFunc or context.Background is used. Canceling it
+	// cancels all request contexts.
+	BaseContext context.Context
+	// Context is an alias for BaseContext.
+	Context context.Context
+	// Ctx is an alias for BaseContext.
+	Ctx context.Context
+	// BaseContextFunc, when set, is called once during server initialization to
+	// obtain the base context. It is ignored when an explicit context is set.
+	BaseContextFunc func() context.Context
+
+	// RequestTimeout bounds the lifetime of an individual handler request. A
+	// zero value disables the per-request deadline; a negative value also
+	// disables it. The request context is canceled when this deadline expires,
+	// when BaseContext is canceled, or when graceful shutdown is initiated.
+	RequestTimeout time.Duration
+	// HandlerTimeout, QueryTimeout, ContextTimeout and Timeout are accepted as
+	// aliases for RequestTimeout. The first positive value wins.
+	HandlerTimeout time.Duration
+	QueryTimeout   time.Duration
+	ContextTimeout time.Duration
+	Timeout        time.Duration
+
+	// ShutdownTimeout bounds parameterless Shutdown. If zero,
+	// DefaultShutdownTimeout is used. A negative value makes Shutdown wait
+	// indefinitely, preserving the historical behavior. ShutdownContext always
+	// uses the caller-supplied context and its deadline.
+	ShutdownTimeout time.Duration
+
+	// DrainTimeout, GracefulShutdownTimeout, GracePeriod and
+	// TerminationGracePeriod are accepted as aliases for ShutdownTimeout. The
+	// first non-zero value in that order is used.
+	DrainTimeout            time.Duration
+	GracefulShutdownTimeout time.Duration
+	GracePeriod             time.Duration
+	TerminationGracePeriod  time.Duration
+	ShutdownGracePeriod     time.Duration
+	GracefulShutdownPeriod  time.Duration
+
+	// Logger optionally receives the forced-shutdown log record. When nil, the
+	// standard package logger is used.
+	Logger Logger
+	// Logf optionally receives the forced-shutdown log record. It takes
+	// precedence over Logger and the standard logger. Log is an alias.
+	Logf func(format string, args ...any)
+	Log  func(format string, args ...any)
+
 	// Shutdown handling
-	lock     sync.RWMutex
-	started  bool
-	shutdown chan struct{}
-	conns    map[net.Conn]struct{}
+	lock            sync.RWMutex
+	started         bool
+	closing         bool
+	shutdown        chan struct{}
+	conns           map[net.Conn]struct{}
+	requestCancels  map[uint64]context.CancelFunc
+	nextRequestID   uint64
+	inFlight        atomic.Int64
+	shutdownCtx     context.Context
+	cancelShutdown  context.CancelFunc
+	notifyStarted   sync.Once
+	forceOnce       sync.Once
+	unfinishedReqs  int
+	unfinishedConns int
+	lastShutdownErr error
 
 	// A pool for UDP message buffers.
 	udpPool sync.Pool
 }
+
+// Logger is the minimal logging interface used by Server.
+type Logger interface {
+	Printf(format string, args ...any)
+}
+
+// DefaultShutdownTimeout is used when Server.ShutdownTimeout and its aliases
+// are zero.
+const DefaultShutdownTimeout = 30 * time.Second
 
 func (srv *Server) tsigProvider() TsigProvider {
 	if srv.TsigProvider != nil {
@@ -283,6 +459,30 @@ func makeUDPBuffer(size int) func() interface{} {
 func (srv *Server) init() {
 	srv.shutdown = make(chan struct{})
 	srv.conns = make(map[net.Conn]struct{})
+	srv.requestCancels = make(map[uint64]context.CancelFunc)
+	srv.closing = false
+	srv.nextRequestID = 0
+	srv.inFlight.Store(0)
+	srv.notifyStarted = sync.Once{}
+	srv.forceOnce = sync.Once{}
+	srv.unfinishedReqs = 0
+	srv.unfinishedConns = 0
+	srv.lastShutdownErr = nil
+
+	base := srv.BaseContext
+	if base == nil {
+		base = srv.Context
+	}
+	if base == nil {
+		base = srv.Ctx
+	}
+	if base == nil && srv.BaseContextFunc != nil {
+		base = srv.BaseContextFunc()
+	}
+	if base == nil {
+		base = context.Background()
+	}
+	srv.shutdownCtx, srv.cancelShutdown = context.WithCancel(base)
 
 	if srv.UDPSize == 0 {
 		srv.UDPSize = MinMsgSize
@@ -307,6 +507,8 @@ func unlockOnce(l sync.Locker) func() {
 
 // ListenAndServe starts a nameserver on the configured address in *Server.
 func (srv *Server) ListenAndServe() error {
+	srv.prepareBaseContext()
+
 	unlock := unlockOnce(&srv.lock)
 	srv.lock.Lock()
 	defer unlock()
@@ -321,6 +523,19 @@ func (srv *Server) ListenAndServe() error {
 	}
 
 	srv.init()
+	defer srv.cancelShutdown()
+
+	if tcpNetwork, udpNetwork, ok := parseDualNetworks(srv.Net); ok {
+		tcpLn, udpConn, err := srv.listenDual(addr, tcpNetwork, udpNetwork)
+		if err != nil {
+			return err
+		}
+		srv.Listener = tcpLn
+		srv.PacketConn = udpConn
+		srv.started = true
+		unlock()
+		return srv.serveBoth(tcpLn, udpConn)
+	}
 
 	switch srv.Net {
 	case "tcp", "tcp4", "tcp6":
@@ -364,9 +579,12 @@ func (srv *Server) ListenAndServe() error {
 	return &Error{err: "bad network"}
 }
 
-// ActivateAndServe starts a nameserver with the PacketConn or Listener
-// configured in *Server. Its main use is to start a server from systemd.
+// ActivateAndServe starts a nameserver with the PacketConn and/or Listener
+// configured in *Server. When both are set, UDP and TCP run together and are
+// shut down together. Its main use is to start a server from systemd.
 func (srv *Server) ActivateAndServe() error {
+	srv.prepareBaseContext()
+
 	unlock := unlockOnce(&srv.lock)
 	srv.lock.Lock()
 	defer unlock()
@@ -376,6 +594,20 @@ func (srv *Server) ActivateAndServe() error {
 	}
 
 	srv.init()
+	defer srv.cancelShutdown()
+
+	if srv.PacketConn != nil && srv.Listener != nil {
+		// Check PacketConn interface's type is valid and value
+		// is not nil
+		if t, ok := srv.PacketConn.(*net.UDPConn); ok && t != nil {
+			if e := setUDPSocketOptions(t); e != nil {
+				return e
+			}
+		}
+		srv.started = true
+		unlock()
+		return srv.serveBoth(srv.Listener, srv.PacketConn)
+	}
 
 	if srv.PacketConn != nil {
 		// Check PacketConn interface's type is valid and value
@@ -399,54 +631,98 @@ func (srv *Server) ActivateAndServe() error {
 
 // Shutdown shuts down a server. After a call to Shutdown, ListenAndServe and
 // ActivateAndServe will return.
+//
+// Shutdown uses Server.ShutdownTimeout (or one of its compatibility aliases)
+// as the total graceful-shutdown limit. A negative value waits indefinitely.
+// Use ShutdownContext to supply a caller-owned deadline.
 func (srv *Server) Shutdown() error {
-	return srv.ShutdownContext(context.Background())
+	timeout := srv.gracefulShutdownTimeout()
+	if timeout < 0 {
+		return srv.ShutdownContext(context.Background())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return srv.ShutdownContext(ctx)
 }
 
 // ShutdownContext shuts down a server. After a call to ShutdownContext,
 // ListenAndServe and ActivateAndServe will return.
 //
-// A context.Context may be passed to limit how long to wait for connections
+// New listeners and connections stop immediately, while already accepted
+// requests continue until their handlers return. Request contexts are canceled
+// when shutdown begins so cooperative handlers can observe the drain. If ctx
+// expires before all work finishes, ShutdownContext closes the remaining
+// transports, records the number of unfinished requests, and returns ctx.Err.
+//
+// A context.Context may be passed to limit how long to wait for requests
 // to terminate.
 func (srv *Server) ShutdownContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	srv.lock.Lock()
-	if !srv.started {
+	if !srv.started && !srv.closing {
 		srv.lock.Unlock()
 		return &Error{err: "server not started"}
 	}
 
-	srv.started = false
+	if !srv.closing {
+		srv.started = false
+		srv.closing = true
 
-	if srv.PacketConn != nil {
-		srv.PacketConn.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		// Cancel request contexts. Handlers that are safe to finish despite
+		// cancellation may still write their final response; the transports
+		// remain open until the graceful deadline expires.
+		if srv.cancelShutdown != nil {
+			srv.cancelShutdown()
+		}
+
+		if srv.PacketConn != nil {
+			srv.PacketConn.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		}
+
+		if srv.Listener != nil {
+			srv.Listener.Close()
+		}
+
+		for rw := range srv.conns {
+			rw.SetReadDeadline(aLongTimeAgo) // Unblock reads
+		}
 	}
 
-	if srv.Listener != nil {
-		srv.Listener.Close()
-	}
-
-	for rw := range srv.conns {
-		rw.SetReadDeadline(aLongTimeAgo) // Unblock reads
-	}
-
+	shutdownCh := srv.shutdown
 	srv.lock.Unlock()
 
 	if testShutdownNotify != nil {
 		testShutdownNotify.Broadcast()
 	}
 
-	var ctxErr error
 	select {
-	case <-srv.shutdown:
+	case <-shutdownCh:
+		// The serve loops close their listeners on exit. Close the packet
+		// connection as well to retain the historical Shutdown behavior.
+		srv.lock.RLock()
+		pc := srv.PacketConn
+		srv.lock.RUnlock()
+		if pc != nil {
+			_ = pc.Close()
+		}
+		return nil
 	case <-ctx.Done():
-		ctxErr = ctx.Err()
+		// If draining completed at the same instant, prefer the clean result
+		// rather than reporting a zero-request forced shutdown.
+		select {
+		case <-shutdownCh:
+			return nil
+		default:
+		}
+		srv.forceOnce.Do(func() {
+			srv.forceShutdown(ctx.Err())
+		})
+		return ctx.Err()
 	}
-
-	if srv.PacketConn != nil {
-		srv.PacketConn.Close()
-	}
-
-	return ctxErr
 }
 
 var testShutdownNotify *sync.Cond
@@ -461,17 +737,19 @@ func (srv *Server) getReadTimeout() time.Duration {
 
 // serveTCP starts a TCP listener for the server.
 func (srv *Server) serveTCP(l net.Listener) error {
-	defer l.Close()
-
-	if srv.NotifyStartedFunc != nil {
-		srv.NotifyStartedFunc()
-	}
-
 	var wg sync.WaitGroup
-	defer func() {
-		wg.Wait()
-		close(srv.shutdown)
-	}()
+	defer close(srv.shutdown)
+	return srv.serveTCPWithWG(l, &wg)
+}
+
+// serveTCPWithWG runs the TCP accept loop and tracks connection goroutines in
+// wg. It does not close srv.shutdown; callers composing protocols own that
+// final close.
+func (srv *Server) serveTCPWithWG(l net.Listener, wg *sync.WaitGroup) error {
+	defer l.Close()
+	defer wg.Wait()
+
+	srv.notifyStartedOnce()
 
 	for srv.isStarted() {
 		rw, err := l.Accept()
@@ -489,7 +767,7 @@ func (srv *Server) serveTCP(l net.Listener) error {
 		srv.conns[rw] = struct{}{}
 		srv.lock.Unlock()
 		wg.Add(1)
-		go srv.serveTCPConn(&wg, rw)
+		go srv.serveTCPConn(wg, rw)
 	}
 
 	return nil
@@ -497,7 +775,17 @@ func (srv *Server) serveTCP(l net.Listener) error {
 
 // serveUDP starts a UDP listener for the server.
 func (srv *Server) serveUDP(l net.PacketConn) error {
+	var wg sync.WaitGroup
+	defer close(srv.shutdown)
+	return srv.serveUDPWithWG(l, &wg)
+}
+
+// serveUDPWithWG runs the UDP read loop and tracks packet goroutines in wg.
+// It does not close srv.shutdown; callers composing protocols own that final
+// close.
+func (srv *Server) serveUDPWithWG(l net.PacketConn, wg *sync.WaitGroup) error {
 	defer l.Close()
+	defer wg.Wait()
 
 	reader := Reader(defaultReader{srv})
 	if srv.DecorateReader != nil {
@@ -510,15 +798,7 @@ func (srv *Server) serveUDP(l net.PacketConn) error {
 		return &Error{err: "PacketConnReader was not implemented on Reader returned from DecorateReader but is required for net.PacketConn"}
 	}
 
-	if srv.NotifyStartedFunc != nil {
-		srv.NotifyStartedFunc()
-	}
-
-	var wg sync.WaitGroup
-	defer func() {
-		wg.Wait()
-		close(srv.shutdown)
-	}()
+	srv.notifyStartedOnce()
 
 	rtimeout := srv.getReadTimeout()
 	// deadline is not used here
@@ -543,6 +823,10 @@ func (srv *Server) serveUDP(l net.PacketConn) error {
 			}
 			return err
 		}
+		// A successful read is treated as admitted work even if Shutdown races
+		// immediately afterward. Real transports unblock a blocked Read with
+		// an error via the past deadline above, so this does not admit reads
+		// started after shutdown.
 		if len(m) < headerSize {
 			if cap(m) == srv.UDPSize {
 				srv.udpPool.Put(m[:srv.UDPSize])
@@ -551,7 +835,7 @@ func (srv *Server) serveUDP(l net.PacketConn) error {
 			continue
 		}
 		wg.Add(1)
-		go srv.serveUDPPacket(&wg, m, l, sUDP, sPC)
+		go srv.serveUDPPacket(wg, m, l, sUDP, sPC)
 	}
 
 	return nil
@@ -636,6 +920,11 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 	req := new(Msg)
 	req.setHdr(dh)
 
+	ctx, endRequest := srv.beginRequest()
+	defer endRequest()
+	req.ctx = ctx
+	w.ctx = ctx
+
 	switch action := srv.MsgAcceptFunc(dh); action {
 	case MsgAccept:
 		err := req.unpack(dh, m, off)
@@ -680,7 +969,20 @@ func (srv *Server) serveDNS(m []byte, w *response) {
 		srv.udpPool.Put(m[:srv.UDPSize])
 	}
 
-	srv.Handler.ServeDNS(w, req) // Writes back to the client
+	if hc := srv.HandlerContext; hc != nil {
+		hc.ServeDNS(ctx, w, req)
+		return
+	}
+	if hc := srv.HandlerWithContext; hc != nil {
+		hc.ServeDNS(ctx, w, req)
+		return
+	}
+	if ch := srv.ContextHandler; ch != nil {
+		ch.ServeDNSContext(ctx, w, req)
+		return
+	}
+
+	dispatchHandler(ctx, srv.Handler, w, req) // Writes back to the client
 }
 
 func (srv *Server) readTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
